@@ -1,0 +1,56 @@
+name: collect
+
+# The snapshot job. Price and ownership history cannot be back-filled, so this
+# runs every night regardless of what else is built.
+on:
+  schedule:
+    - cron: "15 2 * * *"     # 02:15 UTC daily — after overnight price changes
+    - cron: "45 22 * * *"    # 22:45 UTC daily — before the next price deadline
+  workflow_dispatch:
+
+concurrency:
+  group: collect
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # The database is the asset. Restore it, append to it, save it back.
+      - name: Restore database
+        uses: actions/cache/restore@v4
+        with:
+          path: data/fpl.sqlite3
+          key: fpl-db-${{ github.run_id }}
+          restore-keys: fpl-db-
+
+      - name: Collect snapshot
+        env:
+          FPL_ENTRY_ID: ${{ secrets.FPL_ENTRY_ID }}
+          FPL_COOKIE: ${{ secrets.FPL_COOKIE }}
+        run: python -m fpl.collect
+
+      - name: Save database
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: data/fpl.sqlite3
+          key: fpl-db-${{ github.run_id }}
+
+      # A durable copy, so a cache eviction never loses the season's history.
+      - name: Upload database artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fpl-db
+          path: data/fpl.sqlite3
+          retention-days: 90
