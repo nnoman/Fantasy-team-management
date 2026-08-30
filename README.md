@@ -46,6 +46,7 @@ anything intelligent.
 | `fpl/enrich.py` | Per-season player history from element-summary |
 | `fpl/reconcile.py` | Scores predictions against what actually happened |
 | `fpl/status.py` | Health check (`python -m fpl.status`) |
+| `fpl/dashboard.py` | Static HTML page published to GitHub Pages |
 | `tests/test_model.py` | `python -m pytest tests/` |
 | `.github/workflows/collect.yml` | The scheduled pipeline |
 | `.github/workflows/ci.yml` | Tests on push |
@@ -150,6 +151,26 @@ write path, and it ends up more robust than what was originally planned.
 
 Whatever is captured is equivalent to your password: it belongs in a GitHub secret,
 never in a commit, and never pasted into a chat window.
+
+## The dashboard
+
+The pipeline publishes a page to GitHub Pages on every run:
+
+**<https://nnoman.github.io/Fantasy-team-management/>**
+
+Squad, captain, expected points, recent price moves and pipeline health, readable
+from any browser with no GitHub login and no Python install. It is a single
+self-contained file — no external CSS, fonts or scripts — so nothing about it can
+break because a CDN moved.
+
+> **This page is public.** GitHub Pages serves publicly on free plans even from a
+> private repository, so the squad, the projections and the fact that this is entry
+> 6643465 are visible to anyone with the link. It carries `noindex` so search engines
+> should skip it, but that is a request, not a guarantee. Nothing secret is on the
+> page — no tokens, no cookies — but if that visibility is unwanted, delete the
+> `deploy` job from the pipeline and use the Actions job summary instead.
+
+Enabling it is a one-time setting: **Settings → Pages → Source: GitHub Actions**.
 
 ## Checking it works
 

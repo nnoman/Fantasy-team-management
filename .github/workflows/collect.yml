@@ -20,6 +20,13 @@ on:
         type: boolean
         default: false
 
+# contents:read is all the pipeline itself needs; pages+id-token are for the
+# deploy job below, which publishes the dashboard.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
 concurrency:
   group: pipeline
   cancel-in-progress: false
@@ -107,6 +114,17 @@ jobs:
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
+      # A static page, generated from the database that was just updated, so the
+      # squad and the pipeline's health are readable from any browser without a
+      # GitHub login or a Python install.
+      - name: Build dashboard
+        run: python -m fpl.dashboard --out site/index.html
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
       - name: Save database
         uses: actions/cache/save@v4
         if: always()
@@ -122,3 +140,16 @@ jobs:
           name: fpl-db
           path: data/fpl.sqlite3
           retention-days: 90
+
+  # Separate job because actions/deploy-pages needs its own `environment`, which
+  # is job-level. It runs only after the pipeline has produced a fresh page.
+  deploy:
+    needs: run
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
