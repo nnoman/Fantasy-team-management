@@ -56,7 +56,20 @@ def report(store: Store, shortlist: bool = False, own: list[int] | None = None,
     horizon = features.fixture_horizon(store, gw, HORIZON)
     df = project.project(df, horizon, gw, HORIZON)
 
+    # Write the forecast down before the gameweek is played. Like the snapshots,
+    # this cannot be back-filled: once the gameweek has happened there is no way
+    # to recover what the model would have said beforehand, and without that
+    # there is nothing to score the model against later.
     snap = store.latest_snapshot()
+    if record:
+        n = store.save_predictions(
+            gw, snap["id"],
+            ((pid, row.xp_next, row.ep_next, row.p_start) for pid, row in df.iterrows()),
+        )
+        log_note = f"recorded {n} predictions for GW{gw}"
+    else:
+        log_note = "predictions NOT recorded (--no-record)"
+
     print(f"\nFPL Autopilot — advisory report")
     print(f"{_deadline_note(store)}")
     print(f"snapshot #{snap['id']} taken {snap['taken_at']} · "
@@ -118,7 +131,9 @@ def report(store: Store, shortlist: bool = False, own: list[int] | None = None,
     print("    transfer or tactical change. Nothing here has seen 2026/27 football.")
     print("  · No transfer planning, no chips, no price modelling yet — that is the")
     print("    next phase and it needs the authenticated my-team read.")
-    print("  · Advisory only. Nothing in this command can write to your team.\n")
+    print("  · Advisory only. Nothing in this command can write to your team.")
+    print(f"  · {log_note} — `python -m fpl.reconcile` scores them once the")
+    print("    gameweek finishes.\n")
 
 
 def main(argv: list[str] | None = None) -> int:

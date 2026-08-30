@@ -128,3 +128,53 @@ def test_rerunning_a_forecast_replaces_rather_than_duplicates(store):
 
     rows = store.latest_predictions(1)
     assert len(rows) == 1 and rows[0]["xp"] == 6.0
+
+
+def test_advise_records_a_forecast(store, monkeypatch):
+    """Regression: `advise` accepted a `record` flag but never wrote anything.
+
+    The failure was silent — the report printed normally and the prediction
+    table stayed empty, so the gap would only have surfaced weeks later as
+    "no predictions recorded" at the moment we tried to score the model.
+    """
+    import pandas as pd
+
+    from fpl import advise, features, optimise, project
+
+    _gameweek(store, 3, finished=False)
+    store.conn.execute(
+        "UPDATE gameweek SET is_next = 1 WHERE id = 3")
+    store.conn.execute(
+        """INSERT INTO snapshot (id, taken_at, gw_current, gw_next, n_players, rules)
+           VALUES (1, '2026-08-30T06:00:00+00:00', 2, 3, 2, '{}')""")
+    store.conn.commit()
+
+    df = pd.DataFrame([
+        {"id": 1, "name": "A", "pos": "MID", "element_type": 3, "team": 1,
+         "team_short": "AAA", "cost": 50, "xp_next": 4.0, "ep_next": 3.5,
+         "p_start": 0.9, "xp_total": 20.0, "minutes_sample": 900.0, "avail": 1.0},
+        {"id": 2, "name": "B", "pos": "DEF", "element_type": 2, "team": 2,
+         "team_short": "BBB", "cost": 45, "xp_next": 2.0, "ep_next": 2.5,
+         "p_start": 0.5, "xp_total": 10.0, "minutes_sample": 400.0, "avail": 1.0},
+    ]).set_index("id", drop=False)
+
+    monkeypatch.setattr(features, "build", lambda s, snapshot_id=None: df)
+    monkeypatch.setattr(features, "fixture_horizon", lambda s, g, h: {})
+    monkeypatch.setattr(project, "project", lambda d, h, g, w: d)
+    monkeypatch.setattr(optimise, "best_squad", lambda d, r, **kw: optimise.Squad(
+        players=d.assign(starting=True), captain=1, vice=2, bench_order=[],
+        xp_next=6.0, cost=95))
+
+    advise.report(store, record=True)
+
+    rows = store.latest_predictions(3)
+    assert len(rows) == 2, "every projected player must be on file"
+    assert {r["element_id"] for r in rows} == {1, 2}
+    by_id = {r["element_id"]: r for r in rows}
+    assert by_id[1]["xp"] == 4.0 and by_id[1]["ep_next"] == 3.5
+
+    # And --no-record genuinely suppresses it.
+    store.conn.execute("DELETE FROM prediction")
+    store.conn.commit()
+    advise.report(store, record=False)
+    assert store.latest_predictions(3) == []
