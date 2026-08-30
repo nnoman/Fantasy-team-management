@@ -24,6 +24,14 @@ concurrency:
   group: pipeline
   cancel-in-progress: false
 
+# Steps below pipe into tee to reach the job summary. GitHub's default run shell
+# is `bash -e` WITHOUT pipefail, so the exit code of a pipeline is tee's, not the
+# command's -- a failed collect would report a green run. Naming the shell
+# explicitly gets `bash -eo pipefail`, which is the whole point.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   run:
     runs-on: ubuntu-latest
