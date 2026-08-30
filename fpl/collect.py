@@ -49,9 +49,9 @@ def collect(entry_id: int | None = None, db_path=None) -> dict:
         ok=True,
     )
 
-    # Optional: prove the cookie still works, so a dead session is noticed
-    # weeks before it matters rather than at a deadline.
-    if client.has_cookie and entry_id:
+    # Optional: prove the bearer token still works, so a dead session is noticed
+    # before it matters rather than at a deadline.
+    if client.has_token and entry_id:
         try:
             if client.is_authenticated():
                 team = client.my_team(entry_id)
@@ -59,7 +59,7 @@ def collect(entry_id: int | None = None, db_path=None) -> dict:
                 summary["bank"] = team.get("transfers", {}).get("bank")
                 summary["free_transfers"] = team.get("transfers", {}).get("limit")
             else:
-                summary["auth_warning"] = "cookie present but not accepted — re-capture it"
+                summary["auth_warning"] = "token present but not accepted — it has probably expired (8h lifetime)"
         except (AuthExpired, RuntimeError) as exc:
             summary["auth_warning"] = str(exc)
 

@@ -35,7 +35,12 @@ jobs:
 
       - name: Collect snapshot
         env:
-          FPL_ENTRY_ID: ${{ secrets.FPL_ENTRY_ID }}
+          FPL_ENTRY_ID: 6643465
+          # Optional. Without it the snapshot still runs — every field the
+          # projection model reads is public — but the auth health check is
+          # skipped. Cookies are not credentials for this API; the bearer token
+          # is. See README "Authentication: what actually works".
+          FPL_ACCESS_TOKEN: ${{ secrets.FPL_ACCESS_TOKEN }}
           FPL_COOKIE: ${{ secrets.FPL_COOKIE }}
         run: python -m fpl.collect
 

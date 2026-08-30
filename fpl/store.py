@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS snapshot (
     taken_at    TEXT NOT NULL,
     gw_current  INTEGER,
     gw_next     INTEGER,
-    n_players   INTEGER NOT NULL
+    n_players   INTEGER NOT NULL,
+    rules       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS player_snapshot (
@@ -63,7 +64,20 @@ CREATE TABLE IF NOT EXISTS team_snapshot (
     strength_attack_away    INTEGER,
     strength_defence_home   INTEGER,
     strength_defence_away   INTEGER,
+    strength_overall_home   INTEGER,
+    strength_overall_away   INTEGER,
     PRIMARY KEY (snapshot_id, team_id)
+);
+
+-- Deadlines, so the scheduler never has to guess when a gameweek closes.
+CREATE TABLE IF NOT EXISTS gameweek (
+    id              INTEGER PRIMARY KEY,
+    name            TEXT,
+    deadline_time   TEXT,
+    is_current      INTEGER,
+    is_next         INTEGER,
+    finished        INTEGER,
+    updated_at      TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS fixture (
@@ -117,7 +131,23 @@ class Store:
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after a database was first created.
+
+        CREATE TABLE IF NOT EXISTS silently keeps an older table's columns, so
+        new fields have to be ALTERed in explicitly or existing databases would
+        keep reading NULL forever.
+        """
+        have = {r[1] for r in self.conn.execute("PRAGMA table_info(team_snapshot)")}
+        for col in ("strength_overall_home", "strength_overall_away"):
+            if col not in have:
+                self.conn.execute(f"ALTER TABLE team_snapshot ADD COLUMN {col} INTEGER")
+        have = {r[1] for r in self.conn.execute("PRAGMA table_info(snapshot)")}
+        if "rules" not in have:
+            self.conn.execute("ALTER TABLE snapshot ADD COLUMN rules TEXT")
 
     def close(self) -> None:
         self.conn.close()
@@ -130,9 +160,13 @@ class Store:
         gw_current = next((e["id"] for e in events if e.get("is_current")), None)
         gw_next = next((e["id"] for e in events if e.get("is_next")), None)
 
+        # Squad size, budget, team limit and the sell-on fee all come from the
+        # API so the optimiser stays correct if FPL changes them mid-season.
         cur = self.conn.execute(
-            "INSERT INTO snapshot (taken_at, gw_current, gw_next, n_players) VALUES (?,?,?,?)",
-            (utcnow(), gw_current, gw_next, len(data["elements"])),
+            """INSERT INTO snapshot (taken_at, gw_current, gw_next, n_players, rules)
+               VALUES (?,?,?,?,?)""",
+            (utcnow(), gw_current, gw_next, len(data["elements"]),
+             json.dumps(data.get("game_settings") or {}, separators=(",", ":"))),
         )
         sid = cur.lastrowid
 
@@ -160,19 +194,49 @@ class Store:
             ],
         )
 
+        # strength_attack_* and strength_defence_* are all zero until the season
+        # starts; strength_overall_* is populated from day one, so both go in.
         self.conn.executemany(
-            "INSERT INTO team_snapshot VALUES (?,?,?,?,?,?,?,?)",
+            """INSERT INTO team_snapshot
+                 (snapshot_id, team_id, name, short_name,
+                  strength_attack_home, strength_attack_away,
+                  strength_defence_home, strength_defence_away,
+                  strength_overall_home, strength_overall_away)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
             [
                 (
                     sid, t["id"], t["name"], t["short_name"],
                     t.get("strength_attack_home"), t.get("strength_attack_away"),
                     t.get("strength_defence_home"), t.get("strength_defence_away"),
+                    t.get("strength_overall_home"), t.get("strength_overall_away"),
                 )
                 for t in data["teams"]
             ],
         )
+        self.save_gameweeks(events)
         self.conn.commit()
         return sid
+
+    def save_gameweeks(self, events: list) -> int:
+        """Upsert gameweek deadlines. Not append-only: a deadline is a fact
+        about the calendar, not a time series, and FPL does move them."""
+        now = utcnow()
+        self.conn.executemany(
+            """INSERT INTO gameweek VALUES (?,?,?,?,?,?,?)
+               ON CONFLICT(id) DO UPDATE SET
+                 name=excluded.name, deadline_time=excluded.deadline_time,
+                 is_current=excluded.is_current, is_next=excluded.is_next,
+                 finished=excluded.finished, updated_at=excluded.updated_at""",
+            [
+                (
+                    e["id"], e.get("name"), e.get("deadline_time"),
+                    int(bool(e.get("is_current"))), int(bool(e.get("is_next"))),
+                    int(bool(e.get("finished"))), now,
+                )
+                for e in events
+            ],
+        )
+        return len(events)
 
     def save_fixtures(self, fixtures: list) -> int:
         now = utcnow()
@@ -235,4 +299,57 @@ class Store:
     def latest_snapshot(self) -> sqlite3.Row | None:
         return self.conn.execute(
             "SELECT * FROM snapshot ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+    def latest_snapshot_id(self) -> int:
+        row = self.conn.execute("SELECT MAX(id) FROM snapshot").fetchone()
+        if row is None or row[0] is None:
+            raise RuntimeError("no snapshots yet — run `python -m fpl.collect` first")
+        return int(row[0])
+
+    def players(self, snapshot_id: int | None = None) -> list[sqlite3.Row]:
+        sid = snapshot_id or self.latest_snapshot_id()
+        return self.conn.execute(
+            "SELECT * FROM player_snapshot WHERE snapshot_id = ?", (sid,)
+        ).fetchall()
+
+    def teams(self, snapshot_id: int | None = None) -> list[sqlite3.Row]:
+        sid = snapshot_id or self.latest_snapshot_id()
+        return self.conn.execute(
+            "SELECT * FROM team_snapshot WHERE snapshot_id = ?", (sid,)
+        ).fetchall()
+
+    def fixtures(self, first_gw: int, last_gw: int) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """SELECT * FROM fixture
+               WHERE event BETWEEN ? AND ? AND finished = 0
+               ORDER BY event, kickoff_time""",
+            (first_gw, last_gw),
+        ).fetchall()
+
+    def rules(self, snapshot_id: int | None = None) -> dict:
+        """FPL's own squad rules from the latest snapshot, with fallbacks in case
+        an older snapshot predates the column."""
+        sid = snapshot_id or self.latest_snapshot_id()
+        row = self.conn.execute(
+            "SELECT rules FROM snapshot WHERE id = ?", (sid,)
+        ).fetchone()
+        raw = json.loads(row["rules"]) if row and row["rules"] else {}
+        return {
+            "squad_size": raw.get("squad_squadsize", 15),
+            "starting": raw.get("squad_squadplay", 11),
+            "team_limit": raw.get("squad_team_limit", 3),
+            "budget": raw.get("squad_total_spend", 1000),
+            "sell_on_fee": raw.get("transfers_sell_on_fee", 0.5),
+            "transfers_cap": raw.get("transfers_cap", 20),
+            "max_free_transfers": (raw.get("max_extra_free_transfers", 4) or 4) + 1,
+        }
+
+    def next_gameweek(self) -> sqlite3.Row | None:
+        """The gameweek to plan for: the flagged next one, else the earliest
+        unfinished one, so this still answers sensibly mid-season."""
+        return self.conn.execute(
+            """SELECT * FROM gameweek
+               ORDER BY is_next DESC, (finished = 0) DESC, id
+               LIMIT 1"""
         ).fetchone()

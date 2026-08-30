@@ -53,13 +53,27 @@ class Client:
     """Polite, retrying FPL API client.
 
     Authentication is optional: every read the projection model needs is public.
-    A cookie is only required for `my_team` and the write path. Pass one via the
-    FPL_COOKIE environment variable, captured from a browser session — FPL
-    retired scripted password login (users.premierleague.com no longer resolves).
+    A token is only required for `my_team` and the write path.
+
+    FPL authenticates with an OAuth bearer token in the `x-api-authorization`
+    header, issued by PingOne at account.premierleague.com. Session cookies are
+    not credentials — sending them alone returns 403 "Authentication credentials
+    were not provided". Scripted password login is gone too, so the token has to
+    come from a real browser session for now.
+
+    Access tokens live 8 hours, which is short enough that a hand-pasted one
+    cannot survive to a scheduled deadline run. Minting tokens from a refresh
+    token is the next piece of work; until then `FPL_ACCESS_TOKEN` is a
+    short-lived convenience for interactive use.
+
+    FPL_COOKIE is still honoured because Cloudflare and DataDome cookies may be
+    needed alongside the token from some IPs, but on its own it authenticates
+    nothing.
     """
 
-    def __init__(self, cookie: str | None = None, min_interval: float = 1.0,
-                 timeout: float = 30.0, max_retries: int = 4):
+    def __init__(self, cookie: str | None = None, access_token: str | None = None,
+                 min_interval: float = 1.0, timeout: float = 30.0,
+                 max_retries: int = 4):
         self.min_interval = min_interval
         self.timeout = timeout
         self.max_retries = max_retries
@@ -70,8 +84,21 @@ class Client:
         self.session.headers.update({"User-Agent": UA, "Accept": "application/json"})
         cookie = cookie if cookie is not None else os.environ.get("FPL_COOKIE", "")
         if cookie:
+            # Bot-protection cookies only. These do not authenticate on their own.
             self.session.headers["Cookie"] = cookie
+
+        token = (access_token if access_token is not None
+                 else os.environ.get("FPL_ACCESS_TOKEN", "")).strip()
+        if token:
+            # Strip a pasted "Bearer " prefix so both forms work.
+            if token.lower().startswith("bearer "):
+                token = token[7:].strip()
+            self.session.headers["X-Api-Authorization"] = f"Bearer {token}"
+
+        self.has_token = bool(token)
         self.has_cookie = bool(cookie)
+        # Kept for callers written against the old cookie-only assumption.
+        self.authenticated_reads_possible = self.has_token
 
     # ---------- transport ----------
 
@@ -100,10 +127,12 @@ class Client:
             if r.status_code == 200:
                 return r.json()
             if r.status_code in (401, 403):
-                raise AuthExpired(
-                    f"{path} returned {r.status_code}. The session cookie is "
-                    f"missing or expired — re-capture it from a browser."
-                )
+                # 401 means FPL read a token and rejected it; 403 means it saw no
+                # credentials at all. The distinction is the whole diagnosis.
+                hint = ("token expired or malformed — access tokens last 8 hours"
+                        if self.has_token else
+                        "no FPL_ACCESS_TOKEN set — cookies alone do not authenticate")
+                raise AuthExpired(f"{path} returned {r.status_code}: {hint}")
             if r.status_code == 429 or r.status_code >= 500:
                 delay = 2 ** attempt
                 log.warning("%s returned %d, backing off %ds", path, r.status_code, delay)
@@ -155,7 +184,11 @@ class Client:
         return self.get("me/")
 
     def is_authenticated(self) -> bool:
-        """Cheap auth health check. Every scheduled run starts here."""
+        """Cheap auth health check. Every scheduled run starts here.
+
+        `me/` answers 200 with `{"player": null}` when unauthenticated rather than
+        erroring, so a wrong credential fails clearly instead of silently.
+        """
         try:
             return bool(self.me().get("player"))
         except (AuthExpired, RuntimeError) as exc:
@@ -163,5 +196,10 @@ class Client:
             return False
 
     def my_team(self, entry_id: int) -> dict:
-        """Current squad, bank, free transfers, chips. Requires a live cookie."""
+        """Current squad, bank, free transfers, chips. Needs a live bearer token."""
+        if not self.has_token:
+            raise AuthExpired(
+                "my-team requires FPL_ACCESS_TOKEN; session cookies are not "
+                "credentials for this API"
+            )
         return self.get(f"my-team/{entry_id}/")
