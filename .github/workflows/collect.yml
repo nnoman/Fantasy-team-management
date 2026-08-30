@@ -1,20 +1,33 @@
-name: collect
+name: pipeline
 
-# The snapshot job. Price and ownership history cannot be back-filled, so this
-# runs every night regardless of what else is built.
+# The scheduled run: snapshot, project, record predictions, score the last
+# gameweek. All four steps share one restored copy of the database and it is
+# saved once at the end.
+#
+# Deliberately a single job rather than four workflows. The database lives in
+# the Actions cache, and separate workflows would each restore, append and save
+# their own copy — whichever finished last would silently overwrite the others.
+# Sequential steps in one job cannot race.
 on:
   schedule:
     - cron: "15 2 * * *"     # 02:15 UTC daily — after overnight price changes
     - cron: "45 22 * * *"    # 22:45 UTC daily — before the next price deadline
+    - cron: "15 3 * * 1"     # 03:15 UTC Mondays — plus the weekly history refresh
   workflow_dispatch:
+    inputs:
+      enrich:
+        description: "Also refresh per-season player history (~10 minutes)"
+        type: boolean
+        default: false
 
 concurrency:
-  group: collect
+  group: pipeline
   cancel-in-progress: false
 
 jobs:
-  snapshot:
+  run:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -42,7 +55,37 @@ jobs:
           # is. See README "Authentication: what actually works".
           FPL_ACCESS_TOKEN: ${{ secrets.FPL_ACCESS_TOKEN }}
           FPL_COOKIE: ${{ secrets.FPL_COOKIE }}
-        run: python -m fpl.collect
+        run: python -m fpl.collect | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Completed seasons do not change, so this runs weekly rather than nightly:
+      # it is ~620 requests at one per second.
+      - name: Refresh player history
+        if: github.event.schedule == '15 3 * * 1' || inputs.enrich
+        run: python -m fpl.enrich
+
+      # Records what the model expects before the gameweek is played. This
+      # cannot be back-filled — without a forecast on file there is nothing to
+      # score the model against later.
+      - name: Project and record predictions
+        run: |
+          {
+            echo '## Advisory report'
+            echo '```'
+            python -m fpl.advise --shortlist
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Self-guarding: refuses to score a gameweek FPL has not marked finished,
+      # because event/{gw}/live/ serves the previous season's results until then.
+      - name: Score the last finished gameweek
+        continue-on-error: true
+        run: |
+          {
+            echo '## Reconciliation'
+            echo '```'
+            python -m fpl.reconcile || true
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Save database
         uses: actions/cache/save@v4

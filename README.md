@@ -43,8 +43,11 @@ anything intelligent.
 | `fpl/project.py` | Expected points per player per gameweek |
 | `fpl/optimise.py` | PuLP/CBC integer program: squad, XI, captain, bench |
 | `fpl/advise.py` | The advisory report (`python -m fpl.advise`) |
+| `fpl/enrich.py` | Per-season player history from element-summary |
+| `fpl/reconcile.py` | Scores predictions against what actually happened |
 | `tests/test_model.py` | `python -m pytest tests/` |
-| `.github/workflows/collect.yml` | Cron at 02:15 and 22:45 UTC |
+| `.github/workflows/collect.yml` | The scheduled pipeline |
+| `.github/workflows/ci.yml` | Tests on push |
 
 ## How the projection works
 
@@ -71,13 +74,37 @@ contributions and 225 BPS per 90 — and naively projected, he outscores Haaland
 double. Every rate is therefore shrunk toward its position's baseline in proportion to
 minutes played (`features.shrink_rates`). Established players are barely touched.
 
-### What it cannot do yet
+### The season rollover, and why it nearly broke everything
 
-Before GW1, bootstrap-static carries *last season's* aggregates, so every projection
-describes last season's player at last season's club. 195 of 595 players have no
-Premier League minutes at all — promoted clubs, new signings, academy — and fall back
-to a price-based prior, which is a guess dressed as a number. Treat GW1 output as a
-shortlist to argue with, not an answer.
+`bootstrap-static` serves *last* season's per-player aggregates right up until the new
+season starts, then resets them to zero. Both states look identical to a reader — the
+same fields with plausible numbers in them — and code written against one is silently
+wrong against the other:
+
+- Dividing starts by 38 is right in August and reads a nailed-on starter as a **5%**
+  starter in September.
+- `minutes == 0` means "no evidence" before a ball is kicked and "is being dropped"
+  two games in. Treating the second as the first put a fit-but-benched £7.9m forward
+  in the squad and captained him, while FPL's own `ep_next` read him at 0.0.
+- Every per-90 rate computed from a 180-minute sample shrinks to its position
+  baseline, so start probability goes flat across all 600-odd players and the model
+  loses its discrimination entirely.
+
+So nothing divides by a fixed season length any more. `Store.team_games_played()`
+counts finished fixtures per club — not finished gameweeks, because clubs diverge
+through doubles, blanks and postponements — and every rate is read against how much
+could actually have been observed.
+
+The sample-size problem is solved with `fpl/enrich.py`, which pulls each player's
+completed seasons from `element-summary/{id}/history_past` and pools them into the
+current season's rates, weighted by minutes. Rates and roles are blended differently
+on purpose: last season is strong evidence about how often a player shoots or makes
+defensive actions, and weak evidence about whether he is still in the team. Two games
+of being dropped outweighs a season of starting, because from the outside that is what
+a changed role looks like.
+
+Players with no Premier League history at all — promoted clubs, new signings, academy
+— still fall back to a price-based prior, which is a guess dressed as a number.
 
 ## Configuration
 
@@ -123,6 +150,42 @@ write path, and it ends up more robust than what was originally planned.
 Whatever is captured is equivalent to your password: it belongs in a GitHub secret,
 never in a commit, and never pasted into a chat window.
 
+## Automation
+
+One scheduled workflow does everything, in order, over a single restored copy of the
+database: snapshot, refresh history (Mondays), project and record predictions, then
+score the last finished gameweek. It is deliberately one job rather than four
+workflows — the database lives in the Actions cache, and separate workflows would each
+restore, append and save their own copy, so whichever finished last would silently
+overwrite the rest.
+
+| When (UTC) | What |
+| --- | --- |
+| 02:15 daily | Snapshot, project, record predictions, reconcile |
+| 22:45 daily | Same, before FPL's price-change deadline |
+| 03:15 Mondays | Also refreshes per-season player history (~10 min) |
+
+Each run writes the advisory report and the reconciliation into the workflow's job
+summary, so the output is readable in the Actions tab with nothing to download.
+
+Scheduled workflows only fire on the **default branch** — this repo's is `master`, so
+that is where this has to live. GitHub also disables scheduled workflows after 60 days
+without repository activity.
+
+### Why predictions are recorded before kickoff
+
+`fpl/reconcile.py` grades the model against reality and against FPL's own `ep_next`.
+That only works if the forecast was written down *before* the gameweek was played, and
+like the snapshots it cannot be back-filled: once a gameweek has happened there is no
+way to recover what the model would have said beforehand. Every projection run records
+one, which is why `advise` writes to the `prediction` table by default.
+
+Reconciliation refuses to score a gameweek FPL has not marked `finished`. This is not
+caution for its own sake: before the 2026/27 season started, `event/1/live/` served
+*last* season's GW1 in full — 610 players with 90-minute performances against a current
+pool of 623 — so scoring it would have produced a confident and entirely fictitious
+accuracy report.
+
 ## Roadmap
 
 | Phase | Scope | State |
@@ -131,7 +194,20 @@ never in a commit, and never pasted into a chat window.
 | 2 | Projection model, squad/XI/captain advice | **done** |
 | 3 | Multi-gameweek transfer optimiser, chip scenarios | next — needs the authenticated `my-team` read |
 | 4 | Write path, approval gate, full schedule | blocked on the refresh-token flow above |
-| 5 | Backtesting and calibration | starts once GW1 results land |
+| 5 | Backtesting and calibration | **wired** — predictions recorded, reconciliation scheduled |
+
+### Is the model any good yet?
+
+Not yet, and the test suite says so out loud rather than hiding it. Pre-season, with a
+full prior season in `bootstrap-static`, projections correlated 0.80 with FPL's own
+`ep_next`. After the rollover that collapsed to 0.39, which is why the history
+enrichment exists. `test_model_agrees_with_the_fpl_baseline` is marked `xfail` with the
+reason spelled out: until it passes, the model has no business recommending transfers.
+
+The real answer comes from `python -m fpl.reconcile` once a few gameweeks have been
+predicted and played — mean absolute error against reality, ours versus `ep_next`. That
+number, not a correlation against a baseline, is what decides whether any of this was
+worth building.
 
 ## Notes
 

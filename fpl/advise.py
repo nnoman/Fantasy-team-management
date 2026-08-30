@@ -46,7 +46,8 @@ HEADER = (f"  {'':<4}{'player':<17}{'team':<5}{'pos':<5}{'£m':>5}  "
           f"{'strt':>5}  {'xP':>5}  {'xP5':>6}  {'FPL':>5}")
 
 
-def report(store: Store, shortlist: bool = False, own: list[int] | None = None) -> None:
+def report(store: Store, shortlist: bool = False, own: list[int] | None = None,
+           record: bool = True) -> None:
     gw_row = store.next_gameweek()
     gw = gw_row["id"] if gw_row else 1
     rules = store.rules()
@@ -107,8 +108,8 @@ def report(store: Store, shortlist: bool = False, own: list[int] | None = None) 
     print("  ep_next is capped at 4.0 for every premium pre-season, so it is a weak")
     print("  benchmark right now. Real scoring against it starts after GW1.")
 
-    unknown = int((df.minutes_last == 0).sum())
-    in_squad = int((squad.players.minutes_last == 0).sum())
+    unknown = int((df.minutes_sample == 0).sum())
+    in_squad = int((squad.players.minutes_sample == 0).sum())
     print(f"\nREAD THIS BEFORE TRUSTING IT")
     print(f"  · {unknown} of {len(df)} players have no Premier League minutes to")
     print(f"    project from — promoted clubs, new signings, academy. {in_squad} of them")
@@ -134,12 +135,14 @@ def main(argv: list[str] | None = None) -> int:
                     help="also print the best options per position")
     ap.add_argument("--own", help="comma-separated element ids you already own; "
                                   "ranks an XI from them instead of building a squad")
+    ap.add_argument("--no-record", action="store_true",
+                    help="do not write this forecast to the prediction log")
     args = ap.parse_args(argv)
 
     own = [int(x) for x in args.own.split(",")] if args.own else None
     store = Store()
     try:
-        report(store, shortlist=args.shortlist, own=own)
+        report(store, shortlist=args.shortlist, own=own, record=not args.no_record)
     finally:
         store.close()
     return 0
