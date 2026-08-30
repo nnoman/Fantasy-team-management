@@ -51,6 +51,12 @@ class Squad:
     bench_order: list[int] = field(default_factory=list)
     xp_next: float = 0.0                  # expected points for the XI, captain doubled
     cost: int = 0                         # tenths of a million
+    # What the solver actually maximised: the XI and doubled captain, plus a
+    # discounted bench and a discounted five-gameweek horizon. Comparing two
+    # squads means comparing this, not xp_next -- a squad can score fewer points
+    # next week and still be the better squad. Chip scenarios will be compared
+    # on it too.
+    objective: float = 0.0
 
     @property
     def starting(self) -> pd.DataFrame:
@@ -79,13 +85,14 @@ def _solve(df: pd.DataFrame, rules: dict, forced: set[int] | None = None,
     xp = df.xp_next.to_dict()
     future = _future_xp(df).to_dict()
 
-    prob += pulp.lpSum(
+    objective = pulp.lpSum(
         start[i] * xp[i]
         + cap[i] * xp[i]                       # the captain scores twice
         + (squad[i] - start[i]) * xp[i] * BENCH_VALUE
         + squad[i] * future[i] * FUTURE_WEIGHT
         for i in ids
     )
+    prob += objective
 
     prob += pulp.lpSum(squad[i] for i in ids) == rules["squad_size"]
     prob += pulp.lpSum(start[i] for i in ids) == rules["starting"]
@@ -139,6 +146,7 @@ def _solve(df: pd.DataFrame, rules: dict, forced: set[int] | None = None,
         bench_order=bench_order,
         xp_next=float(xi.xp_next.sum() + df.xp_next[captain]),
         cost=int(picked.cost.sum()),
+        objective=float(pulp.value(objective)),
     )
 
 
@@ -148,10 +156,17 @@ def best_squad(df: pd.DataFrame, rules: dict, forced: set[int] | None = None,
     """Build a 15-man squad from the whole player pool under the budget.
 
     Players FPL has flagged as injured, suspended or ineligible are dropped
-    outright by default. Buying one as a cheap bench filler is a real tactic, but
-    it needs a human decision, not a solver quietly doing it.
+    outright by default, and so are players FPL itself rates at zero expected
+    points despite an "available" status -- it evidently knows something the
+    status letter does not. Buying either as a cheap bench filler is a real
+    tactic, but it needs a human decision, not a solver quietly doing it.
+
+    This is a guard, not a model input. The projection never sees ep_next, so
+    reconciliation against that baseline stays an honest comparison.
     """
     pool = df[df.avail > 0] if exclude_unavailable else df
+    if exclude_unavailable and "fpl_writeoff" in pool.columns:
+        pool = pool[~pool.fpl_writeoff]
     if banned:
         pool = pool.drop(index=[i for i in banned if i in pool.index], errors="ignore")
     return _solve(pool, rules, forced=forced)

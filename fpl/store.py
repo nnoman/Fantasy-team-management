@@ -77,7 +77,70 @@ CREATE TABLE IF NOT EXISTS gameweek (
     is_current      INTEGER,
     is_next         INTEGER,
     finished        INTEGER,
+    data_checked    INTEGER,
     updated_at      TEXT NOT NULL
+);
+
+-- Per-season totals from element-summary, the only place a player's prior
+-- seasons survive once the new season resets bootstrap-static's aggregates.
+-- Keyed on element_code, which is stable across seasons; the per-season `id`
+-- is not. Not append-only: a completed season is a fixed fact.
+CREATE TABLE IF NOT EXISTS player_history_past (
+    element_code    INTEGER NOT NULL,
+    season_name     TEXT NOT NULL,
+    minutes         INTEGER,
+    starts          INTEGER,
+    total_points    INTEGER,
+    goals_scored    INTEGER,
+    assists         INTEGER,
+    expected_goals          REAL,
+    expected_assists        REAL,
+    expected_goals_conceded REAL,
+    defensive_contribution  INTEGER,
+    bps             INTEGER,
+    saves           INTEGER,
+    yellow_cards    INTEGER,
+    updated_at      TEXT NOT NULL,
+    PRIMARY KEY (element_code, season_name)
+);
+
+-- Which players element-summary has been asked about, and when. Needed because
+-- a player who has never appeared in the Premier League has no history_past at
+-- all, so "did we already fetch this one?" cannot be answered from
+-- player_history_past -- and without it the weekly job re-fetches every
+-- historyless player forever, on an API we do not own.
+CREATE TABLE IF NOT EXISTS history_fetch (
+    element_code    INTEGER PRIMARY KEY,
+    seasons         INTEGER NOT NULL,
+    fetched_at      TEXT NOT NULL
+);
+
+-- What the model said, recorded before kickoff. Append-only and, like the
+-- snapshots, impossible to back-fill: once a gameweek is played there is no way
+-- to recover what we would have predicted beforehand. Every projection run
+-- writes here, so a D-26h forecast and a D-4h one are both kept and can be
+-- compared.
+CREATE TABLE IF NOT EXISTS prediction (
+    gw              INTEGER NOT NULL,
+    element_id      INTEGER NOT NULL,
+    made_at         TEXT NOT NULL,
+    snapshot_id     INTEGER REFERENCES snapshot(id),
+    xp              REAL NOT NULL,
+    ep_next         REAL,                    -- FPL's own number, the baseline
+    p_start         REAL,
+    PRIMARY KEY (gw, element_id, made_at)
+);
+CREATE INDEX IF NOT EXISTS idx_prediction_gw ON prediction(gw);
+
+-- What actually happened, pulled from event/{gw}/live once the gameweek is
+-- finished and bonus points have been confirmed.
+CREATE TABLE IF NOT EXISTS actual (
+    gw              INTEGER NOT NULL,
+    element_id      INTEGER NOT NULL,
+    minutes         INTEGER,
+    total_points    INTEGER,
+    scored_at       TEXT NOT NULL,
+    PRIMARY KEY (gw, element_id)
 );
 
 CREATE TABLE IF NOT EXISTS fixture (
@@ -148,6 +211,9 @@ class Store:
         have = {r[1] for r in self.conn.execute("PRAGMA table_info(snapshot)")}
         if "rules" not in have:
             self.conn.execute("ALTER TABLE snapshot ADD COLUMN rules TEXT")
+        have = {r[1] for r in self.conn.execute("PRAGMA table_info(gameweek)")}
+        if "data_checked" not in have:
+            self.conn.execute("ALTER TABLE gameweek ADD COLUMN data_checked INTEGER")
 
     def close(self) -> None:
         self.conn.close()
@@ -222,16 +288,20 @@ class Store:
         about the calendar, not a time series, and FPL does move them."""
         now = utcnow()
         self.conn.executemany(
-            """INSERT INTO gameweek VALUES (?,?,?,?,?,?,?)
+            """INSERT INTO gameweek
+                 (id, name, deadline_time, is_current, is_next, finished,
+                  data_checked, updated_at)
+               VALUES (?,?,?,?,?,?,?,?)
                ON CONFLICT(id) DO UPDATE SET
                  name=excluded.name, deadline_time=excluded.deadline_time,
                  is_current=excluded.is_current, is_next=excluded.is_next,
-                 finished=excluded.finished, updated_at=excluded.updated_at""",
+                 finished=excluded.finished, data_checked=excluded.data_checked,
+                 updated_at=excluded.updated_at""",
             [
                 (
                     e["id"], e.get("name"), e.get("deadline_time"),
                     int(bool(e.get("is_current"))), int(bool(e.get("is_next"))),
-                    int(bool(e.get("finished"))), now,
+                    int(bool(e.get("finished"))), int(bool(e.get("data_checked"))), now,
                 )
                 for e in events
             ],
@@ -283,6 +353,127 @@ class Store:
         )
         self.conn.commit()
         return [dict(r) for r in rows]
+
+    def save_predictions(self, gw: int, snapshot_id: int, rows,
+                         made_at: str | None = None) -> int:
+        """Record what the model expects, before the gameweek is played.
+
+        `rows` is an iterable of (element_id, xp, ep_next, p_start). One
+        `made_at` stamps the whole run, so a single forecast is one readable set
+        and re-running within the same second replaces it rather than
+        accumulating duplicates.
+        """
+        made_at = made_at or utcnow()
+        rows = list(rows)
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO prediction VALUES (?,?,?,?,?,?,?)",
+            [(gw, int(eid), made_at, snapshot_id, float(xp),
+              None if ep is None else float(ep),
+              None if ps is None else float(ps))
+             for eid, xp, ep, ps in rows],
+        )
+        self.conn.commit()
+        return len(rows)
+
+    def save_actuals(self, gw: int, rows) -> int:
+        """Record what really happened. `rows` is (element_id, minutes, points)."""
+        now = utcnow()
+        rows = list(rows)
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO actual VALUES (?,?,?,?,?)",
+            [(gw, int(eid), int(mins), int(pts), now) for eid, mins, pts in rows],
+        )
+        self.conn.commit()
+        return len(rows)
+
+    def save_history_past(self, element_code: int, seasons: list) -> int:
+        now = utcnow()
+        self.conn.executemany(
+            """INSERT INTO player_history_past VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(element_code, season_name) DO UPDATE SET
+                 minutes=excluded.minutes, starts=excluded.starts,
+                 total_points=excluded.total_points,
+                 goals_scored=excluded.goals_scored, assists=excluded.assists,
+                 expected_goals=excluded.expected_goals,
+                 expected_assists=excluded.expected_assists,
+                 expected_goals_conceded=excluded.expected_goals_conceded,
+                 defensive_contribution=excluded.defensive_contribution,
+                 bps=excluded.bps, saves=excluded.saves,
+                 yellow_cards=excluded.yellow_cards, updated_at=excluded.updated_at""",
+            [
+                (
+                    element_code, h["season_name"], h.get("minutes"), h.get("starts"),
+                    h.get("total_points"), h.get("goals_scored"), h.get("assists"),
+                    _num(h.get("expected_goals")), _num(h.get("expected_assists")),
+                    _num(h.get("expected_goals_conceded")),
+                    h.get("defensive_contribution"), h.get("bps"), h.get("saves"),
+                    h.get("yellow_cards"), now,
+                )
+                for h in seasons
+            ],
+        )
+        self.conn.commit()
+        return len(seasons)
+
+    def mark_history_fetched(self, element_code: int, seasons: int) -> None:
+        self.conn.execute(
+            """INSERT INTO history_fetch VALUES (?,?,?)
+               ON CONFLICT(element_code) DO UPDATE SET
+                 seasons=excluded.seasons, fetched_at=excluded.fetched_at""",
+            (element_code, seasons, utcnow()),
+        )
+        self.conn.commit()
+
+    def history_fetched(self) -> set[int]:
+        return {r[0] for r in self.conn.execute("SELECT element_code FROM history_fetch")}
+
+    def previous_season(self) -> dict[int, sqlite3.Row]:
+        """Each player's most recent completed season, keyed by element_code."""
+        return {
+            r["element_code"]: r
+            for r in self.conn.execute(
+                """SELECT h.* FROM player_history_past h
+                   JOIN (SELECT element_code, MAX(season_name) AS s
+                         FROM player_history_past GROUP BY element_code) m
+                     ON m.element_code = h.element_code AND m.s = h.season_name"""
+            )
+        }
+
+    def history_coverage(self) -> int:
+        return self.conn.execute(
+            "SELECT COUNT(DISTINCT element_code) FROM player_history_past"
+        ).fetchone()[0]
+
+    def latest_predictions(self, gw: int) -> list[sqlite3.Row]:
+        """The most recent forecast for a gameweek — the one that would have been
+        acted on, so the one worth scoring."""
+        return self.conn.execute(
+            """SELECT p.* FROM prediction p
+               WHERE p.gw = ? AND p.made_at = (
+                   SELECT MAX(made_at) FROM prediction WHERE gw = ?
+               )""",
+            (gw, gw),
+        ).fetchall()
+
+    def team_games_played(self) -> dict[int, int]:
+        """Finished fixtures per team.
+
+        Not the finished-gameweek count: teams diverge through double and blank
+        gameweeks and postponements, and every rate in the feature layer is
+        divided by this.
+        """
+        played: dict[int, int] = {}
+        for f in self.conn.execute(
+            "SELECT team_h, team_a FROM fixture WHERE finished = 1"
+        ):
+            played[f["team_h"]] = played.get(f["team_h"], 0) + 1
+            played[f["team_a"]] = played.get(f["team_a"], 0) + 1
+        return played
+
+    def gameweek(self, gw: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM gameweek WHERE id = ?", (gw,)
+        ).fetchone()
 
     def log_run(self, job: str, status: str, detail: str = "") -> None:
         self.conn.execute(

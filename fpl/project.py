@@ -45,6 +45,12 @@ LEAGUE_AVG_GOALS = 1.45           # goals per team per game
 HOME_ADVANTAGE = 1.10             # multiplier on the home side's scoring
 STRENGTH_ELASTICITY = 0.70        # how hard team strength bends the scoreline
 
+# How much of the conceded rate comes from a team's own recorded expected goals
+# conceded rather than from FPL's coarse 1-5 strength rating. The rating buckets
+# twenty clubs into five levels; xGC per 90 separates the two ends of a bucket,
+# and clean sheets are worth 4 points to a defender, so the difference is real.
+XGC_WEIGHT = 0.5
+
 # --- minutes model -----------------------------------------------------------
 STARTER_MINUTES = 85
 CAMEO_MINUTES = 22
@@ -112,6 +118,13 @@ def project_fixture(row: pd.Series, fx: Fixture, opp_strength_home: int,
     opp_strength = opp_strength_away if fx.is_home else opp_strength_home
     team_scored, team_conceded = team_goal_rates(own_strength, opp_strength, fx.is_home)
     attack_mult = team_scored / LEAGUE_AVG_GOALS
+
+    # Temper the strength-derived rate with what this player's side has actually
+    # conceded per 90, rescaled to this fixture. Without this, every club inside
+    # a strength band gets an identical clean-sheet probability.
+    if row.xgc90 > 0:
+        observed = row.xgc90 * (team_conceded / LEAGUE_AVG_GOALS)
+        team_conceded = (1 - XGC_WEIGHT) * team_conceded + XGC_WEIGHT * observed
 
     p_start = float(row.p_start)
     p_cameo = max(0.0, float(row.avail) - p_start) * P_BENCH_APPEARS
