@@ -95,6 +95,18 @@ jobs:
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
+      # Fails the run if the database is stale, empty or missing history, so a
+      # pipeline that silently stopped producing usable data shows up red rather
+      # than green-with-nothing-in-it.
+      - name: Health check
+        run: |
+          {
+            echo '## Health'
+            echo '```'
+            python -m fpl.status
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: Save database
         uses: actions/cache/save@v4
         if: always()

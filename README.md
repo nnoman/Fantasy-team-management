@@ -45,6 +45,7 @@ anything intelligent.
 | `fpl/advise.py` | The advisory report (`python -m fpl.advise`) |
 | `fpl/enrich.py` | Per-season player history from element-summary |
 | `fpl/reconcile.py` | Scores predictions against what actually happened |
+| `fpl/status.py` | Health check (`python -m fpl.status`) |
 | `tests/test_model.py` | `python -m pytest tests/` |
 | `.github/workflows/collect.yml` | The scheduled pipeline |
 | `.github/workflows/ci.yml` | Tests on push |
@@ -149,6 +150,63 @@ write path, and it ends up more robust than what was originally planned.
 
 Whatever is captured is equivalent to your password: it belongs in a GitHub secret,
 never in a commit, and never pasted into a chat window.
+
+## Checking it works
+
+```bash
+python -m fpl.status
+```
+
+Every check prints OK, WARN or FAIL and, when something is wrong, the command that
+fixes it. Exit code is 0 unless something FAILed, so it works as a cron or CI guard,
+and it runs as the last step of the scheduled pipeline.
+
+```
+  [OK  ] database                 19.4 MB, 8 snapshots
+  [OK  ] snapshot freshness       newest is 4h old
+  [OK  ] player history           520/623 players have prior seasons
+  [OK  ] next gameweek            GW3, deadline in 5.3d
+  [OK  ] predictions              623 for GW3, made 3h ago
+```
+
+Snapshot freshness is the check that matters most. Everything downstream still looks
+perfectly valid when the schedule stops firing — the data is just quietly old — so
+anything past 30 hours is treated as a failure rather than a warning.
+
+## Running it on a second machine
+
+The repository carries **no database** — `data/*.sqlite3` is gitignored, and the
+season's history is the one thing that cannot be rebuilt from a clone. So a fresh
+checkout needs the data from somewhere.
+
+```bash
+git clone https://github.com/nnoman/Fantasy-team-management.git
+cd Fantasy-team-management
+pip install -r requirements.txt
+```
+
+Then pick one:
+
+**Copy the database from the cloud run.** Actions → the latest `pipeline` run →
+Artifacts → `fpl-db` → unzip into `data/fpl.sqlite3`. This keeps one shared history
+across machines and is the right choice if the pipeline has been running.
+
+**Or build a fresh one locally**, which costs about eleven minutes of API calls and
+starts the price and prediction history over from today:
+
+```bash
+python -m fpl.collect     # seconds
+python -m fpl.enrich      # ~10 minutes, one request per player
+python -m fpl.status      # confirm
+```
+
+Two machines writing their own copies will diverge — snapshots and predictions are
+append-only per database, and there is no merge. Treat the cloud run as the source of
+truth and copy from it, rather than collecting independently in two places.
+
+You may not need a local copy at all: the scheduled run posts the advisory report,
+the reconciliation and the health check into its job summary, readable from any
+browser in the Actions tab.
 
 ## Automation
 

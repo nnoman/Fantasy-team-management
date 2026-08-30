@@ -188,8 +188,11 @@ def utcnow() -> str:
 
 
 class Store:
-    def __init__(self, path: Path | str = DEFAULT_DB):
-        self.path = Path(path)
+    def __init__(self, path: Path | str | None = None):
+        # Resolved at call time, not bound as a default argument: a default is
+        # evaluated once at import, so overriding DEFAULT_DB later would leave
+        # Store() silently opening the original file.
+        self.path = Path(path) if path is not None else DEFAULT_DB
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
