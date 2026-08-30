@@ -6,16 +6,22 @@ Snapshots the FPL API nightly, projects expected points per player per gameweek,
 solves the squad as a multi-week optimisation, and applies the result — after you
 approve it.
 
-**Status: phase 1 (collector) is live. Nothing writes to the FPL account yet.**
+**Status: phases 1-2 are live — collector plus advisory projections. Nothing writes
+to the FPL account, and the write path is blocked on an auth change (see below).**
 
 ## Quick start
 
 ```bash
 pip install -r requirements.txt
-FPL_ENTRY_ID=6643465 python -m fpl.collect
+
+FPL_ENTRY_ID=6643465 python -m fpl.collect   # snapshot the game state
+python -m fpl.advise --shortlist             # projections, squad, XI, captain
 ```
 
-Writes to `data/fpl.sqlite3`. Safe to run repeatedly — snapshots are append-only.
+`collect` writes to `data/fpl.sqlite3` and is safe to run repeatedly — snapshots are
+append-only. `advise` is read-only, needs no credentials and no network: it reads the
+snapshot, projects expected points, solves the squad as an integer program and prints
+the result. Neither command can touch your FPL team.
 
 ## Why the database matters
 
@@ -33,55 +39,99 @@ anything intelligent.
 | `fpl/client.py` | HTTP, retries, rate limiting, schema validation, auth health check |
 | `fpl/store.py` | SQLite schema, append-only snapshots, price-change detection |
 | `fpl/collect.py` | The nightly job |
+| `fpl/features.py` | Per-90 rates, minutes model, fixture horizon, availability |
+| `fpl/project.py` | Expected points per player per gameweek |
+| `fpl/optimise.py` | PuLP/CBC integer program: squad, XI, captain, bench |
+| `fpl/advise.py` | The advisory report (`python -m fpl.advise`) |
+| `tests/test_model.py` | `python -m pytest tests/` |
 | `.github/workflows/collect.yml` | Cron at 02:15 and 22:45 UTC |
+
+## How the projection works
+
+FPL scoring is additive, so expected points decompose and each part is modelled
+separately:
+
+```
+xP = P(plays) x [ appearance + goals + assists + clean_sheet
+                  + defensive_contribution + saves + bonus ]
+     - expected_deductions
+```
+
+Minutes dominate. A brilliant player with a 40% chance of starting is worth less than
+a dull nailed-on one, and that is where most managers actually lose points. Attacking
+returns come from xG and xA per 90 scaled by projected minutes and opponent strength,
+never from raw goals. Clean sheets run team expected goals conceded through a Poisson.
+Defensive contribution is a threshold crossing (10 for defenders, 12 for midfielders
+and forwards), so it needs a distribution rather than a mean.
+
+One thing is load-bearing and easy to miss: **FPL's per-90 fields are unusable raw**.
+They divide a season total by minutes played with no regard for sample size, so a
+midfielder who played two minutes and won one tackle reads as 45 defensive
+contributions and 225 BPS per 90 — and naively projected, he outscores Haaland by
+double. Every rate is therefore shrunk toward its position's baseline in proportion to
+minutes played (`features.shrink_rates`). Established players are barely touched.
+
+### What it cannot do yet
+
+Before GW1, bootstrap-static carries *last season's* aggregates, so every projection
+describes last season's player at last season's club. 195 of 595 players have no
+Premier League minutes at all — promoted clubs, new signings, academy — and fall back
+to a price-based prior, which is a guess dressed as a number. Treat GW1 output as a
+shortlist to argue with, not an answer.
 
 ## Configuration
 
-Both are optional for the collector and required for the write path.
-
 | Variable | Purpose |
 | --- | --- |
-| `FPL_ENTRY_ID` | `6643465` |
-| `FPL_COOKIE` | Browser session cookie. Enables reading your squad and, later, writing to it. |
+| `FPL_ENTRY_ID` | `6643465`. Only needed by the collector's optional squad check. |
+| `FPL_ACCESS_TOKEN` | Bearer token for reading your squad and, later, writing to it. Not yet wired up — see below. |
 
-### Capturing `FPL_COOKIE`
+Neither is needed for `advise`, or for the snapshot itself. Everything the projection
+model reads is public.
 
-FPL retired scripted password login — `users.premierleague.com` no longer resolves
-at all, and `account.premierleague.com` sits behind bot protection. There is no way
-to hand a script your password. Instead the bot borrows a session you create yourself:
+### Authentication: what actually works
 
-1. Log in to <https://fantasy.premierleague.com> in Chrome.
-2. DevTools (F12) → **Application** → **Storage** → **Cookies** → `https://fantasy.premierleague.com`.
-3. Copy the values of **`pl_profile`** and **`sessionid`** — these are the ones that
-   carry the session. `pl_guest_id` is an anonymous visitor ID and does **not**
-   authenticate anything.
-4. Set the variable as one string:
-   `FPL_COOKIE="pl_profile=<value>; sessionid=<value>"`
+Earlier revisions of this file told you to capture `pl_profile` and `sessionid` into
+an `FPL_COOKIE`. **That is wrong and cannot work.** Probed live on 2026-08-20:
 
-Verify it:
+| Sent to `api/my-team/{id}/` | Response |
+| --- | --- |
+| Session cookies only | `403 {"detail":"Authentication credentials were not provided."}` |
+| `x-api-authorization: Bearer <jwt>` | `401 {"detail": "Signature verification failed"}` on a bad token |
 
-```bash
-FPL_COOKIE="pl_profile=...; sessionid=..." python -c \
-  "from fpl.client import Client; print('authenticated:', Client().is_authenticated())"
+Cookies are not credentials here — FPL sees no auth at all. The real mechanism is an
+OAuth bearer token in the `x-api-authorization` header, issued by PingOne:
+
+```
+issuer     https://account.premierleague.com/as
+token      https://account.premierleague.com/as/token
+client_id  bfcbaf69-aade-4c1b-8f00-c1cb8a193030
+audience   https://api.pingone.eu
+scope      openid profile email
+lifetime   8 hours
 ```
 
-`me/` returns `{"player": null}` when the cookie is not working, so a wrong value
-fails clearly rather than silently.
+Eight hours is the problem. A hand-pasted token is dead long before the next deadline
+run, so pasting cannot support a cron schedule at all — which makes the original plan's
+"re-paste a cookie monthly" chore not merely tedious but impossible.
 
-The cookie expires periodically — expect to re-capture it roughly monthly. Every
-scheduled run health-checks it and warns early, so it never surprises you at a
-deadline. Treat it as equivalent to your password: it belongs in a GitHub secret,
-never in a commit.
+The fix is to stop pasting. The discovery document advertises the `refresh_token`
+grant and the `offline_access` scope, so a refresh token captured **once** would let
+the bot mint its own access tokens indefinitely. That is the next piece of work on the
+write path, and it ends up more robust than what was originally planned.
+
+Whatever is captured is equivalent to your password: it belongs in a GitHub secret,
+never in a commit, and never pasted into a chat window.
 
 ## Roadmap
 
 | Phase | Scope | State |
 | --- | --- | --- |
 | 1 | Collector, store, nightly cron | **done** |
-| 2 | Projection model, best XI, captain — advisory | next |
-| 3 | Multi-gameweek transfer optimiser, chip scenarios | |
-| 4 | Write path, approval gate, full schedule | |
-| 5 | Backtesting and calibration | ongoing |
+| 2 | Projection model, squad/XI/captain advice | **done** |
+| 3 | Multi-gameweek transfer optimiser, chip scenarios | next — needs the authenticated `my-team` read |
+| 4 | Write path, approval gate, full schedule | blocked on the refresh-token flow above |
+| 5 | Backtesting and calibration | starts once GW1 results land |
 
 ## Notes
 
