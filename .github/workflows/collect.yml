@@ -26,6 +26,7 @@ permissions:
   contents: read
   pages: write
   id-token: write
+  issues: write      # the notification is a GitHub issue, which emails you
 
 concurrency:
   group: pipeline
@@ -119,6 +120,35 @@ jobs:
       # GitHub login or a Python install.
       - name: Build dashboard
         run: python -m fpl.dashboard --out site/index.html
+
+      # Email, without SMTP credentials. GitHub emails the repo owner when an
+      # issue is opened, so one issue per gameweek is one email per gameweek.
+      # Later runs edit the body in place, which does not email; a comment is
+      # posted only when the recommendation itself changes, which does.
+      - name: Notify by email
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TITLE="$(python -m fpl.dashboard --title)"
+          python -m fpl.dashboard --brief > brief.md
+          NEW_HASH="$(grep -o 'plan:[0-9a-f]*' brief.md | head -1)"
+
+          NUMBER="$(gh issue list --state open --limit 50             --json number,title --jq             "map(select(.title == \"$TITLE\")) | .[0].number // empty")"
+
+          if [ -z "$NUMBER" ]; then
+            gh issue create --title "$TITLE" --body-file brief.md
+            echo "opened a new issue for $TITLE"
+          else
+            OLD_HASH="$(gh issue view "$NUMBER" --json body --jq .body               | grep -o 'plan:[0-9a-f]*' | head -1)"
+            gh issue edit "$NUMBER" --body-file brief.md
+            if [ "$OLD_HASH" != "$NEW_HASH" ]; then
+              gh issue comment "$NUMBER" --body                 "The recommendation changed — see the updated plan above."
+              echo "plan changed ($OLD_HASH -> $NEW_HASH), commented"
+            else
+              echo "plan unchanged, body refreshed silently"
+            fi
+          fi
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

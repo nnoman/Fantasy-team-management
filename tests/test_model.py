@@ -225,17 +225,15 @@ def test_projection_is_in_a_believable_range(projected):
     assert df.xp_next.mean() < 3.0
 
 
-@pytest.mark.xfail(
-    reason="Known gap, not a flake. With only two gameweeks of data every rate "
-           "shrinks to its position baseline, so the model has little "
-           "discrimination and trails FPL's ep_next (~0.39 correlation against "
-           "0.80 pre-season, when bootstrap still carried a full prior season). "
-           "The fix is enriching from element-summary history_past rather than "
-           "loosening this bound. Until it passes, the model must not be "
-           "trusted with transfers.",
-    strict=False,
-)
 def test_model_agrees_with_the_fpl_baseline(projected):
+    """Was xfail through the season rollover and now holds.
+
+    It collapsed to 0.39 when bootstrap-static reset and every rate shrank to
+    its position baseline. Enriching from element-summary history_past brought
+    it to 0.54, and counting provisionally-finished fixtures as played -- rather
+    than only bonus-confirmed ones -- took it to 0.66. If this goes red again the
+    model has regressed and should not be driving transfer advice.
+    """
     df, _ = projected
     assert df.xp_next.corr(df.ep_next) > 0.6
 

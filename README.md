@@ -46,6 +46,8 @@ anything intelligent.
 | `fpl/enrich.py` | Per-season player history from element-summary |
 | `fpl/reconcile.py` | Scores predictions against what actually happened |
 | `fpl/status.py` | Health check (`python -m fpl.status`) |
+| `fpl/team.py` | Your real squad, bank and free transfers (public data) |
+| `fpl/plan.py` | Transfer planner against the squad you own |
 | `fpl/dashboard.py` | Static HTML page published to GitHub Pages |
 | `tests/test_model.py` | `python -m pytest tests/` |
 | `.github/workflows/collect.yml` | The scheduled pipeline |
@@ -158,8 +160,20 @@ The pipeline publishes a page to GitHub Pages on every run:
 
 **<https://nnoman.github.io/Fantasy-team-management/>**
 
-Squad, captain, expected points, recent price moves and pipeline health, readable
-from any browser with no GitHub login and no Python install. It is a single
+The recommended transfers for the next deadline, your actual squad with both
+estimates side by side, the best XI and captain, recent price moves and pipeline
+health — readable from any browser with no GitHub login and no Python install.
+
+It is advisory. There is no write path in this project: you apply the transfers
+yourself in the FPL app. A page on `github.io` could not do it anyway — the browser's
+same-origin policy stops it reading a logged-in FPL tab, and FPL sends no CORS
+headers, so it cannot call the API at all.
+
+**Email**: the pipeline opens one GitHub issue per gameweek with the plan, and GitHub
+emails the repo owner when an issue is opened. No SMTP credentials involved. Later
+runs edit that issue silently; a comment — and therefore a second email — is sent only
+when the recommendation actually changes, compared by a hash of the moves and captain
+rather than the whole body. It is a single
 self-contained file — no external CSS, fonts or scripts — so nothing about it can
 break because a CDN moved.
 

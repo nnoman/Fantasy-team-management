@@ -152,6 +152,7 @@ CREATE TABLE IF NOT EXISTS fixture (
     team_a_difficulty INTEGER,
     kickoff_time    TEXT,
     finished        INTEGER,
+    finished_provisional INTEGER,
     updated_at      TEXT NOT NULL
 );
 
@@ -217,6 +218,10 @@ class Store:
         have = {r[1] for r in self.conn.execute("PRAGMA table_info(gameweek)")}
         if "data_checked" not in have:
             self.conn.execute("ALTER TABLE gameweek ADD COLUMN data_checked INTEGER")
+        have = {r[1] for r in self.conn.execute("PRAGMA table_info(fixture)")}
+        if "finished_provisional" not in have:
+            self.conn.execute(
+                "ALTER TABLE fixture ADD COLUMN finished_provisional INTEGER")
 
     def close(self) -> None:
         self.conn.close()
@@ -314,17 +319,22 @@ class Store:
     def save_fixtures(self, fixtures: list) -> int:
         now = utcnow()
         self.conn.executemany(
-            """INSERT INTO fixture VALUES (?,?,?,?,?,?,?,?,?)
+            """INSERT INTO fixture
+                 (id, event, team_h, team_a, team_h_difficulty, team_a_difficulty,
+                  kickoff_time, finished, finished_provisional, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(id) DO UPDATE SET
                  event=excluded.event, team_h_difficulty=excluded.team_h_difficulty,
                  team_a_difficulty=excluded.team_a_difficulty,
                  kickoff_time=excluded.kickoff_time, finished=excluded.finished,
+                 finished_provisional=excluded.finished_provisional,
                  updated_at=excluded.updated_at""",
             [
                 (
                     f["id"], f.get("event"), f["team_h"], f["team_a"],
                     f.get("team_h_difficulty"), f.get("team_a_difficulty"),
-                    f.get("kickoff_time"), int(bool(f.get("finished"))), now,
+                    f.get("kickoff_time"), int(bool(f.get("finished"))),
+                    int(bool(f.get("finished_provisional"))), now,
                 )
                 for f in fixtures
             ],
@@ -465,9 +475,15 @@ class Store:
         gameweeks and postponements, and every rate in the feature layer is
         divided by this.
         """
+        # `finished` only flips once FPL has confirmed bonus points, which can
+        # be days after the match. `finished_provisional` marks a match that has
+        # actually been played. Counting only `finished` reported one game when
+        # two had been played, which inflated every start rate -- two starts
+        # divided by one game reads as a certainty.
         played: dict[int, int] = {}
         for f in self.conn.execute(
-            "SELECT team_h, team_a FROM fixture WHERE finished = 1"
+            """SELECT team_h, team_a FROM fixture
+               WHERE finished = 1 OR finished_provisional = 1"""
         ):
             played[f["team_h"]] = played.get(f["team_h"], 0) + 1
             played[f["team_a"]] = played.get(f["team_a"], 0) + 1

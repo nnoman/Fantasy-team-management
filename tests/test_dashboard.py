@@ -45,11 +45,19 @@ def test_page_declares_both_themes(page):
     assert "--ground" in page
 
 
+def test_the_plan_is_the_first_thing_on_the_page(page):
+    """The page exists to answer "what do I do before Friday", so the transfer
+    recommendation comes before the squad and before any model diagnostics."""
+    plan_at = page.index("Recommended transfers")
+    assert plan_at < page.index("Your squad")
+    assert plan_at < page.index("Recent price moves")
+
+
 def test_squad_and_captain_are_shown(page):
     assert ">C<" in page, "the captain must be marked"
-    assert "Suggested squad" in page
-    # 15 squad rows, plus whatever the price table holds.
-    assert page.count("<tr") >= 16
+    assert "Your squad" in page
+    # 15 owned players, 15 in the model's ideal squad, plus the price table.
+    assert page.count("<tr") >= 30
 
 
 def test_deadline_is_readable_without_javascript(page):

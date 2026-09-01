@@ -76,3 +76,33 @@ def test_budget_is_sellable_value_plus_bank():
                       free_transfers=2)
     assert t.budget == 102 * 3 + 15
     assert t.element_ids == [1, 2, 3]
+
+
+def test_a_played_match_counts_before_bonus_is_confirmed(tmp_path):
+    """FPL leaves `finished` false until bonus points are confirmed, which can be
+    days after the whistle. Counting only that reported one game played when two
+    had been, and two starts divided by one game reads as a certainty.
+    """
+    from fpl.store import Store
+
+    store = Store(tmp_path / "fx.sqlite3")
+    try:
+        store.save_fixtures([
+            # Played and fully confirmed.
+            {"id": 1, "event": 1, "team_h": 1, "team_a": 2, "team_h_difficulty": 3,
+             "team_a_difficulty": 3, "kickoff_time": "2026-08-21T19:00:00Z",
+             "finished": True, "finished_provisional": True},
+            # Played, bonus not yet confirmed — this is the case that was missed.
+            {"id": 2, "event": 2, "team_h": 2, "team_a": 1, "team_h_difficulty": 3,
+             "team_a_difficulty": 3, "kickoff_time": "2026-08-28T19:00:00Z",
+             "finished": False, "finished_provisional": True},
+            # Not played at all.
+            {"id": 3, "event": 3, "team_h": 1, "team_a": 2, "team_h_difficulty": 3,
+             "team_a_difficulty": 3, "kickoff_time": "2026-09-04T19:00:00Z",
+             "finished": False, "finished_provisional": False},
+        ])
+        played = store.team_games_played()
+        assert played[1] == 2, "a provisionally finished match has still been played"
+        assert played[2] == 2
+    finally:
+        store.close()
