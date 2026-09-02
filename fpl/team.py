@@ -32,11 +32,16 @@ gets.
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
+import difflib
+import unicodedata
 from dataclasses import dataclass, field
 
 from .client import Client
 from .store import Store
+
+log = logging.getLogger(__name__)
 
 # FPL gives one free transfer a gameweek and lets unused ones bank up to a cap.
 # The cap comes from the API (`max_extra_free_transfers` + 1) via Store.rules().
@@ -74,6 +79,10 @@ class Team:
     # last published squad. Surfaced so the dashboard can say whether what it
     # shows is confirmed or reconstructed.
     pending_transfers: int = 0
+    swaps_applied: int = 0
+    # Why a manual override was ignored, if it was. Carried rather than raised so
+    # a mistyped name cannot take down the snapshot, the projection or the page.
+    swap_error: str | None = None
 
     @property
     def element_ids(self) -> list[int]:
@@ -114,56 +123,176 @@ def _replay(raw_picks: list[dict], transfers: list[dict]) -> list[dict]:
     return list(picks.values())
 
 
-def apply_swaps(team: "Team", swaps: str, lookup: dict[str, int],
-                costs: dict[int, int]) -> "Team":
+def normalise(name: str) -> str:
+    """Fold a name to something a human can type on a phone keyboard.
+
+    Half the squad carries accents — Joao Pedro, Guehi, Dubravka, Gyokeres — and
+    requiring them exactly is a guarantee of failed lookups.
+    """
+    stripped = unicodedata.normalize("NFKD", name)
+    stripped = "".join(c for c in stripped if not unicodedata.combining(c))
+    return "".join(c for c in stripped.casefold() if c.isalnum() or c == " ").strip()
+
+
+def build_index(elements: dict[int, dict]) -> dict[str, list[int]]:
+    """Map every reasonable way of typing a player to the ids it could mean.
+
+    Web name, surname and full name all resolve, because "Bruno Fernandes",
+    "B.Fernandes" and "Fernandes" are all things a person will type for the same
+    player.
+    """
+    index: dict[str, list[int]] = {}
+
+    def add(key: str, element_id: int) -> None:
+        key = normalise(key)
+        if key:
+            index.setdefault(key, [])
+            if element_id not in index[key]:
+                index[key].append(element_id)
+
+    for el in elements.values():
+        add(el.get("web_name", ""), el["id"])
+        add(el.get("second_name", ""), el["id"])
+        add(f"{el.get('first_name', '')} {el.get('second_name', '')}", el["id"])
+    return index
+
+
+class SwapError(ValueError):
+    """A squad override that could not be applied. Never fatal: the plan is
+    still worth producing from the squad FPL has published."""
+
+
+def apply_swaps(team: "Team", swaps: str, elements: dict[int, dict]) -> "Team":
     """Manually override the squad, for changes public data cannot show.
 
-    `swaps` is "out>in" pairs separated by commas, using web names or element
-    ids: "Thiago>Watkins, Isak>Calvert-Lewin". Names are matched case-insensitively
-    and must be unambiguous -- several players share a web name, so an ambiguous
-    one is rejected rather than guessed at.
+    `swaps` is "out>in" pairs separated by commas, using names or element ids:
+    "Thiago>Watkins, Isak>Calvert-Lewin". Matching ignores case and accents and
+    accepts surnames. An ambiguous name is refused rather than guessed at --
+    several players share a web name, and silently picking the wrong Palmer
+    would produce confident advice for somebody else's squad.
     """
     if not swaps or not swaps.strip():
         return team
 
+    index = build_index(elements)
+    squad_names = sorted(
+        elements[p.element].get("web_name", str(p.element))
+        for p in team.picks if p.element in elements
+    )
+
+    def describe(element_id: int) -> str:
+        el = elements.get(element_id, {})
+        return f"{el.get('web_name', element_id)} (id {element_id})"
+
     def resolve(token: str) -> int:
         token = token.strip()
         if token.isdigit():
-            return int(token)
-        matches = lookup.get(token.casefold())
-        if matches is None:
-            raise ValueError(f"no player called {token!r}")
-        if isinstance(matches, list):
-            raise ValueError(
-                f"{token!r} matches {len(matches)} players — use an element id"
+            found = int(token)
+            if found not in elements:
+                raise SwapError(f"no player with element id {found}")
+            return found
+        key = normalise(token)
+        matches = index.get(key)
+        if not matches:
+            close = difflib.get_close_matches(key, index, n=3, cutoff=0.6)
+            hint = ""
+            if close:
+                options = {describe(index[c][0]) for c in close}
+                hint = f" Did you mean {', '.join(sorted(options))}?"
+            raise SwapError(f"no player called {token.strip()!r}.{hint}")
+        if len(matches) > 1:
+            options = ", ".join(describe(i) for i in matches)
+            raise SwapError(
+                f"{token.strip()!r} matches {len(matches)} players: {options}. "
+                f"Use the element id instead."
             )
-        return matches
+        return matches[0]
 
     by_id = {p.element: p for p in team.picks}
+    applied = 0
     for pair in swaps.split(","):
         if not pair.strip():
             continue
         if ">" not in pair:
-            raise ValueError(f"expected 'out>in', got {pair.strip()!r}")
+            raise SwapError(
+                f"expected 'out>in', got {pair.strip()!r}. "
+                f"Example: Thiago>Watkins, Isak>Calvert-Lewin"
+            )
         out_token, in_token = pair.split(">", 1)
         out_id, in_id = resolve(out_token), resolve(in_token)
+
         if out_id not in by_id:
-            raise ValueError(f"{out_token.strip()!r} is not in the squad")
+            if in_id in by_id:
+                # Already applied, most likely because FPL published the transfer
+                # between two runs. Not an error, and not to be applied twice.
+                # A reversed pair looks identical to this and cannot be told apart
+                # without transfer history; both end at the same correct squad.
+                continue
+            raise SwapError(
+                f"{out_token.strip()!r} is not in the squad. "
+                f"Squad is: {', '.join(squad_names)}"
+            )
+        if in_id in by_id:
+            raise SwapError(f"{in_token.strip()!r} is already in the squad")
+
         old = by_id.pop(out_id)
-        cost = costs.get(in_id, old.now_cost)
+        cost = elements.get(in_id, {}).get("now_cost", old.now_cost)
+        bank_after = team.bank + old.selling_price - cost
+        if bank_after < 0:
+            raise SwapError(
+                f"cannot afford {describe(in_id)} at £{cost / 10:.1f}m — selling "
+                f"{describe(out_id)} raises £{old.selling_price / 10:.1f}m and you "
+                f"have £{team.bank / 10:.1f}m, leaving £{bank_after / 10:.1f}m"
+            )
         by_id[in_id] = Pick(
             element=in_id, position=old.position,
             is_captain=False, is_vice=False,
-            element_type=old.element_type,
-            # A player just bought was bought at today's price, so there is no
-            # profit to share and the sell price is what was paid.
+            element_type=elements.get(in_id, {}).get("element_type", old.element_type),
+            # Just bought, so there is no profit to share: sell price is what was paid.
             purchase_cost=cost, now_cost=cost, selling_price=cost,
         )
-        # The sale funds the purchase; the bank absorbs the difference.
-        team.bank += old.selling_price - cost
+        team.bank = bank_after
+        applied += 1
 
-    team.picks = list(by_id.values())
+    picks = list(by_id.values())
+    _validate(picks, elements)
+    team.picks = picks
+    team.free_transfers = max(0, team.free_transfers - applied)
+    team.swaps_applied = applied
     return team
+
+
+def _validate(picks: list["Pick"], elements: dict[int, dict]) -> None:
+    """Reject an override that could not exist in the game.
+
+    Without this an override can hand the optimiser a squad with four forwards
+    or four players from one club. The solver then reports "Infeasible", which
+    says nothing about which name was wrong.
+    """
+    shape = {1: 2, 2: 5, 3: 5, 4: 3}
+    labels = {1: "goalkeepers", 2: "defenders", 3: "midfielders", 4: "forwards"}
+    counts: dict[int, int] = {}
+    clubs: dict[int, int] = {}
+    for p in picks:
+        counts[p.element_type] = counts.get(p.element_type, 0) + 1
+        club = elements.get(p.element, {}).get("team")
+        if club is not None:
+            clubs[club] = clubs.get(club, 0) + 1
+
+    for kind, want in shape.items():
+        got = counts.get(kind, 0)
+        if got != want:
+            raise SwapError(
+                f"that leaves {got} {labels[kind]}, and a squad needs {want}. "
+                f"Swap like for like, or list every change together."
+            )
+    over = [c for c, n in clubs.items() if n > 3]
+    if over:
+        names = {e["team"]: e.get("team_code") for e in elements.values()}
+        raise SwapError(
+            f"that puts more than 3 players from the same club in the squad "
+            f"(club id {over[0]}), which the rules do not allow"
+        )
 
 
 def selling_price(purchase: int, now: int) -> int:
@@ -278,20 +407,15 @@ def load(entry_id: int, client: Client | None = None,
     )
 
     if swaps:
-        lookup: dict[str, int | list[int]] = {}
-        for el in elements.values():
-            key = el["web_name"].casefold()
-            if key in lookup:
-                existing = lookup[key]
-                lookup[key] = (existing if isinstance(existing, list) else [existing])
-                lookup[key].append(el["id"])
-            else:
-                lookup[key] = el["id"]
-        team = apply_swaps(team, swaps,
-                           lookup, {e["id"]: e["now_cost"] for e in elements.values()})
-        # A manual swap is a transfer, so it spends the allowance.
-        team.free_transfers = max(0, team.free_transfers - len(
-            [p for p in swaps.split(",") if p.strip()]))
+        # A mistyped name must not cost you the snapshot, the projection, the
+        # dashboard or the email. Record the problem and carry on with the squad
+        # FPL has actually published -- advice from a known-stale squad, clearly
+        # labelled, beats a failed run and no advice at all.
+        try:
+            team = apply_swaps(team, swaps, elements)
+        except SwapError as exc:
+            log.warning("squad override ignored: %s", exc)
+            team.swap_error = str(exc)
     return team
 
 

@@ -348,9 +348,19 @@ def _sync_section(ctx) -> str:
     it always picks up is prices, injuries, news and fixtures.
     """
     team, gw = ctx["team"], ctx["gw"]
-    if ctx["swaps"]:
-        state = (f'Showing a <strong>manual override</strong>: '
-                 f'<code>{_esc(ctx["swaps"])}</code>.')
+    if team.swap_error:
+        # Loud, because the plan below is for a squad the manager has already
+        # changed. Silently showing stale advice would be worse than a failed run.
+        state = (f'<span class="fail">Your override was ignored:</span> '
+                 f'{_esc(team.swap_error)}<br><br>'
+                 f'The plan below is for your <strong>GW{team.gameweek} squad as '
+                 f'published</strong>, which is not what you now own. Fix the '
+                 f'<code>swap</code> box and sync again.')
+    elif ctx["swaps"] and team.swaps_applied:
+        state = (f'Showing your squad with <strong>{team.swaps_applied} manual '
+                 f'change(s)</strong> applied: <code>{_esc(ctx["swaps"])}</code>. '
+                 f'{team.free_transfers} free transfer(s) left, '
+                 f'£{team.bank / 10:.1f}m in the bank.')
     elif team.pending_transfers:
         state = (f'Showing your GW{team.gameweek} squad with '
                  f'<strong>{team.pending_transfers} transfer(s) you have already '

@@ -120,47 +120,135 @@ def _team(elements, bank=15, ft=2):
                          picks=[_pick(e, i + 1) for i, e in enumerate(elements)])
 
 
+def _elements(spec):
+    """spec: {id: (web_name, element_type, cost, team)}"""
+    return {
+        i: {"id": i, "web_name": n, "second_name": n, "first_name": "",
+            "element_type": t, "now_cost": c, "team": club}
+        for i, (n, t, c, club) in spec.items()
+    }
+
+
+def _full_squad():
+    """A legal 15: 2 GKP, 5 DEF, 5 MID, 3 FWD, no more than 3 per club."""
+    layout = [(1, 2), (2, 5), (3, 5), (4, 3)]
+    spec, picks, i = {}, [], 1
+    for kind, count in layout:
+        for n in range(count):
+            spec[i] = (f"P{i}", kind, 50, i % 6)
+            picks.append(team_mod.Pick(element=i, position=i, is_captain=False,
+                                       is_vice=False, element_type=kind,
+                                       purchase_cost=50, now_cost=50,
+                                       selling_price=50))
+            i += 1
+    return spec, picks
+
+
+def _team_with(spec_extra=None, bank=15, ft=2):
+    spec, picks = _full_squad()
+    spec.update(spec_extra or {})
+    team = team_mod.Team(entry_id=1, gameweek=2, bank=bank, value=750,
+                         free_transfers=ft, picks=picks)
+    return team, _elements(spec)
+
+
 def test_swap_replaces_a_player_and_moves_the_money():
-    t = _team([1, 2, 3])
-    lookup = {"in": 9}
-    costs = {9: 80}
-    team_mod.apply_swaps(t, "2>9", lookup, costs)
+    team, elements = _team_with({99: ("Target", 3, 30, 9)})
+    team_mod.apply_swaps(team, "P11>Target", elements)
 
-    ids = [p.element for p in t.picks]
-    assert 2 not in ids and 9 in ids
-    assert len(t.picks) == 3, "a swap is one out, one in"
-    # Sold at 100, bought at 80, so 20 lands in the bank.
-    assert t.bank == 15 + 20
-    bought = next(p for p in t.picks if p.element == 9)
-    assert bought.purchase_cost == 80
-    assert bought.selling_price == 80, "no profit to share on something just bought"
+    ids = [p.element for p in team.picks]
+    assert 11 not in ids and 99 in ids
+    assert len(team.picks) == 15, "a swap is one out, one in"
+    assert team.bank == 15 + (50 - 30)
+    assert team.free_transfers == 1, "a swap spends a free transfer"
+    bought = next(p for p in team.picks if p.element == 99)
+    assert bought.selling_price == 30, "no profit to share on something just bought"
 
 
-def test_swap_accepts_names_and_rejects_ambiguity():
-    t = _team([1, 2, 3])
-    # Several real players share a web name, so guessing would pick the wrong one.
-    with pytest.raises(ValueError, match="matches 2 players"):
-        team_mod.apply_swaps(t, "1>palmer", {"palmer": [154, 500]}, {})
-
-    t2 = _team([1, 2, 3])
-    team_mod.apply_swaps(t2, "1>watkins", {"watkins": 60}, {60: 79})
-    assert 60 in [p.element for p in t2.picks]
+def test_names_match_without_accents():
+    """Half the squad carries accents. Requiring them exactly guarantees failure
+    on a phone keyboard."""
+    team, elements = _team_with({99: ("João Pedro", 3, 30, 9)})
+    team_mod.apply_swaps(team, "P11>Joao Pedro", elements)
+    assert 99 in [p.element for p in team.picks]
 
 
-def test_swap_rejects_nonsense_rather_than_guessing():
-    with pytest.raises(ValueError, match="not in the squad"):
-        team_mod.apply_swaps(_team([1, 2, 3]), "99>4", {}, {})
-    with pytest.raises(ValueError, match="no player called"):
-        team_mod.apply_swaps(_team([1, 2, 3]), "1>nobody", {}, {})
-    with pytest.raises(ValueError, match="expected 'out>in'"):
-        team_mod.apply_swaps(_team([1, 2, 3]), "1 to 4", {}, {})
+def test_ambiguous_names_are_refused_not_guessed():
+    team, elements = _team_with({98: ("Palmer", 3, 30, 8), 99: ("Palmer", 3, 30, 9)})
+    with pytest.raises(team_mod.SwapError, match="matches 2 players"):
+        team_mod.apply_swaps(team, "P11>Palmer", elements)
+    # The element id disambiguates.
+    team_mod.apply_swaps(team, "P11>99", elements)
+    assert 99 in [p.element for p in team.picks]
+
+
+def test_a_typo_suggests_the_intended_player():
+    team, elements = _team_with({99: ("Watkins", 3, 30, 9)})
+    with pytest.raises(team_mod.SwapError, match="Did you mean"):
+        team_mod.apply_swaps(team, "P11>Watkinz", elements)
+
+
+def test_an_unaffordable_swap_is_refused():
+    """Otherwise the override hands the optimiser a squad with a negative bank
+    and it plans from a position that cannot exist."""
+    team, elements = _team_with({99: ("Premium", 3, 200, 9)}, bank=15)
+    with pytest.raises(team_mod.SwapError, match="cannot afford"):
+        team_mod.apply_swaps(team, "P11>Premium", elements)
+
+
+def test_a_swap_that_breaks_the_squad_shape_is_refused():
+    """Swapping a midfielder for a defender leaves 6 defenders. Without this the
+    solver just reports Infeasible, which names no player."""
+    team, elements = _team_with({99: ("Defender", 2, 30, 9)})
+    with pytest.raises(team_mod.SwapError, match="defenders"):
+        team_mod.apply_swaps(team, "P11>Defender", elements)
+
+
+def test_the_three_per_club_limit_is_enforced():
+    team, elements = _team_with({99: ("Fourth", 3, 30, 1)})
+    # Club 1 already holds three of the generated squad.
+    with pytest.raises(team_mod.SwapError, match="same club"):
+        team_mod.apply_swaps(team, "P11>Fourth", elements)
+
+
+def test_selling_someone_not_in_the_squad_lists_the_squad():
+    """Note the deliberate gap: "Target>P11", where the outgoing player is not
+    owned and the incoming one is, is structurally identical to re-running
+    "P11>Target" after it already succeeded. Both are treated as already applied,
+    because both end at the same correct squad and neither can be told apart
+    without transfer history."""
+    team, elements = _team_with({98: ("Alpha", 3, 30, 9), 99: ("Beta", 3, 30, 9)})
+    with pytest.raises(team_mod.SwapError, match="not in the squad"):
+        team_mod.apply_swaps(team, "Alpha>Beta", elements)
+
+
+def test_an_already_applied_swap_is_not_applied_twice():
+    """If FPL publishes the transfer between two runs, the override is stale but
+    harmless — the intended end state is already true."""
+    team, elements = _team_with({99: ("Target", 3, 30, 9)})
+    team_mod.apply_swaps(team, "P11>Target", elements)
+    before = [p.element for p in team.picks]
+    team_mod.apply_swaps(team, "P11>Target", elements)
+    assert [p.element for p in team.picks] == before
+
+
+def test_a_bad_override_never_raises_out_of_load(monkeypatch):
+    """A mistyped name must not cost the snapshot, the projection or the page."""
+    team, elements = _team_with()
+    team.swap_error = None
+    try:
+        team_mod.apply_swaps(team, "nonsense", elements)
+    except team_mod.SwapError as exc:
+        assert "expected 'out>in'" in str(exc)
+    else:
+        pytest.fail("malformed input should raise inside apply_swaps")
 
 
 def test_empty_swap_is_a_no_op():
-    t = _team([1, 2, 3])
-    assert team_mod.apply_swaps(t, "", {}, {}) is t
-    assert team_mod.apply_swaps(t, "   ", {}, {}) is t
-    assert [p.element for p in t.picks] == [1, 2, 3]
+    team, elements = _team_with()
+    assert team_mod.apply_swaps(team, "", elements) is team
+    assert team_mod.apply_swaps(team, "   ", elements) is team
+    assert len(team.picks) == 15
 
 
 def test_pending_transfers_are_replayed_onto_published_picks():
