@@ -19,6 +19,10 @@ on:
         description: "Also refresh per-season player history (~10 minutes)"
         type: boolean
         default: false
+      swap:
+        description: "Squad changes FPL has not published yet, e.g. Thiago>Watkins, Isak>Nketiah"
+        type: string
+        default: ""
 
 # contents:read is all the pipeline itself needs; pages+id-token are for the
 # deploy job below, which publishes the dashboard.
@@ -82,6 +86,9 @@ jobs:
       # Records what the model expects before the gameweek is played. This
       # cannot be back-filled — without a forecast on file there is nothing to
       # score the model against later.
+      # SWAP is the manual override for a squad changed before the deadline:
+      # FPL publishes picks per completed gameweek, so a change made an hour ago
+      # is a 404 until the deadline passes.
       - name: Project and record predictions
         run: |
           {
@@ -119,7 +126,9 @@ jobs:
       # squad and the pipeline's health are readable from any browser without a
       # GitHub login or a Python install.
       - name: Build dashboard
-        run: python -m fpl.dashboard --out site/index.html
+        env:
+          SWAP: ${{ inputs.swap }}
+        run: python -m fpl.dashboard --out site/index.html --swaps "$SWAP"
 
       # Email, without SMTP credentials. GitHub emails the repo owner when an
       # issue is opened, so one issue per gameweek is one email per gameweek.
@@ -129,9 +138,13 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
+          # Passed as an environment variable rather than interpolated into the
+          # script below: `${{ }}` substitution happens before bash parses the
+          # command, so an input containing shell metacharacters would execute.
+          SWAP: ${{ inputs.swap }}
         run: |
           TITLE="$(python -m fpl.dashboard --title)"
-          python -m fpl.dashboard --brief > brief.md
+          python -m fpl.dashboard --brief --swaps "$SWAP" > brief.md
           NEW_HASH="$(grep -o 'plan:[0-9a-f]*' brief.md | head -1)"
 
           NUMBER="$(gh issue list --state open --limit 50             --json number,title --jq             "map(select(.title == \"$TITLE\")) | .[0].number // empty")"

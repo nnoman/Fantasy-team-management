@@ -33,11 +33,24 @@ def test_page_is_well_formed(page):
     assert re.search(r"<title>.*?</title>", page)
 
 
-def test_page_is_self_contained(page):
+def test_page_loads_no_external_resources(page):
     """No external CSS, fonts, scripts or images: GitHub Pages serves one file,
-    and a CDN going away must not be able to break it."""
-    external = re.findall(r'(?:src|href)="(https?://[^"]+)"', page)
-    assert external == [], f"external references found: {external}"
+    and a CDN going away must not be able to break it.
+
+    Anchor hrefs are fine and deliberately excluded — a link is somewhere the
+    reader may choose to go, not something the page fetches to render itself.
+    """
+    resources = re.findall(
+        r'<(?:link|script|img|iframe|source|embed)\s[^>]*?(?:src|href)="(https?://[^"]+)"',
+        page, re.I)
+    assert resources == [], f"external resources found: {resources}"
+
+
+def test_outbound_links_are_only_to_github(page):
+    links = re.findall(r'<a\s[^>]*?href="(https?://[^"]+)"', page, re.I)
+    assert links, "the sync button should be present"
+    for url in links:
+        assert url.startswith("https://github.com/"), f"unexpected outbound link: {url}"
 
 
 def test_page_declares_both_themes(page):

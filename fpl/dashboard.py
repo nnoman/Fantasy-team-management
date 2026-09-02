@@ -29,6 +29,11 @@ HORIZON = 5
 # Whose team to plan for. Public data, so no login is involved anywhere here.
 DEFAULT_ENTRY = 6643465
 
+# Where "Sync" sends you. GitHub does not support pre-filling workflow inputs
+# from a URL, so this opens the run page and you press the button there.
+REPO = "nnoman/Fantasy-team-management"
+RUN_URL = f"https://github.com/{REPO}/actions/workflows/collect.yml"
+
 
 def _esc(value) -> str:
     return html.escape(str(value))
@@ -101,6 +106,11 @@ li{margin-bottom:.35em}
 footer{margin-top:52px;padding-top:20px;border-top:1px solid var(--line);
   font-size:.78rem;color:var(--ink-faint)}
 code{background:var(--sunk);padding:.1em .35em;border-radius:3px;font-size:.85em}
+.btn{display:inline-block;background:var(--accent-2);color:#fff;text-decoration:none;
+  font-weight:700;font-size:.9rem;padding:11px 20px;border-radius:6px;margin:0 0 18px}
+.btn:hover{filter:brightness(1.08)}
+:root:not([data-theme="light"]) .btn{color:#08201e}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]) .btn{color:#08201e}}
 @media (max-width:600px){body{padding:0 14px 56px}header{padding-top:32px}}
 """
 
@@ -247,9 +257,9 @@ def _team_table(df, team, plan) -> str:
             '</tr></thead><tbody>' + "".join(rows) + '</tbody></table></div>')
 
 
-def brief(store: Store, entry_id: int = DEFAULT_ENTRY) -> str:
+def brief(store: Store, entry_id: int = DEFAULT_ENTRY, swaps: str = "") -> str:
     """Short markdown summary, for the email notification."""
-    ctx = context(store, entry_id)
+    ctx = context(store, entry_id, swaps)
     plan, df, team, gw = ctx["plan"], ctx["df"], ctx["team"], ctx["gw"]
     lines = [f"## GW{gw} plan — deadline {ctx['deadline_text']}", ""]
 
@@ -307,7 +317,7 @@ def title(store: Store, entry_id: int = DEFAULT_ENTRY) -> str:
     return f"GW{gw_row['id'] if gw_row else '?'} plan"
 
 
-def context(store: Store, entry_id: int = DEFAULT_ENTRY) -> dict:
+def context(store: Store, entry_id: int = DEFAULT_ENTRY, swaps: str = "") -> dict:
     """Everything both renderers need, computed once."""
     gw_row = store.next_gameweek()
     gw = gw_row["id"] if gw_row else 1
@@ -315,7 +325,7 @@ def context(store: Store, entry_id: int = DEFAULT_ENTRY) -> dict:
     df = features.build(store)
     df = project.project(df, features.fixture_horizon(store, gw, HORIZON), gw, HORIZON)
 
-    team = team_mod.load(entry_id, cap=rules["max_free_transfers"])
+    team = team_mod.load(entry_id, cap=rules["max_free_transfers"], swaps=swaps)
     plan = plan_mod.build(df, team, rules)
 
     deadline = _iso(gw_row["deadline_time"]) if gw_row else None
@@ -323,13 +333,54 @@ def context(store: Store, entry_id: int = DEFAULT_ENTRY) -> dict:
         "gw": gw, "rules": rules, "df": df, "team": team, "plan": plan,
         "deadline": deadline,
         "deadline_text": deadline.strftime("%a %d %b %H:%M UTC") if deadline else "unknown",
+        "swaps": swaps,
         "page_url": "https://nnoman.github.io/Fantasy-team-management/",
         "snapshot": store.latest_snapshot(),
     }
 
 
-def render(store: Store, entry_id: int = DEFAULT_ENTRY) -> str:
-    ctx = context(store, entry_id)
+def _sync_section(ctx) -> str:
+    """Explain what a refresh can and cannot pick up.
+
+    The honest part matters more than the button. FPL publishes picks per
+    completed gameweek, so `entry/{id}/event/{next}/picks/` is a 404 until the
+    deadline passes -- a refresh cannot see a team you changed an hour ago. What
+    it always picks up is prices, injuries, news and fixtures.
+    """
+    team, gw = ctx["team"], ctx["gw"]
+    if ctx["swaps"]:
+        state = (f'Showing a <strong>manual override</strong>: '
+                 f'<code>{_esc(ctx["swaps"])}</code>.')
+    elif team.pending_transfers:
+        state = (f'Showing your GW{team.gameweek} squad with '
+                 f'<strong>{team.pending_transfers} transfer(s) you have already '
+                 f'made for GW{gw}</strong> replayed onto it.')
+    else:
+        state = (f'Showing your <strong>confirmed GW{team.gameweek} squad</strong>. '
+                 f'FPL has published no changes for GW{gw}.')
+
+    return f"""<section>
+  <h2>Syncing your team</h2>
+  <p class="note" style="border-left-color:var(--accent-2)">{state}</p>
+  <p><a class="btn" href="{RUN_URL}">Sync now →</a></p>
+  <p class="note" style="border-left-color:var(--line-hard)">
+  <strong>What a sync picks up:</strong> prices, injuries, team news, fixtures, and
+  any transfer FPL has published. Takes about two minutes, then this page updates.
+  <br><br>
+  <strong>What it cannot:</strong> a squad change you made for GW{gw} that FPL has
+  not published yet. Picks are released per completed gameweek, so
+  <code>event/{gw}/picks/</code> returns 404 until the deadline passes. If you have
+  already made changes, type them into the <code>swap</code> box on the sync page as
+  <code>Thiago&gt;Watkins, Isak&gt;Calvert-Lewin</code> — web names or element ids,
+  and each one spends a free transfer.
+  <br><br>
+  Reading a pre-deadline squad directly needs an authenticated
+  <code>my-team</code> call, which this project does not have.</p>
+</section>"""
+
+
+def render(store: Store, entry_id: int = DEFAULT_ENTRY, swaps: str = "") -> str:
+    ctx = context(store, entry_id, swaps)
     gw, rules, df = ctx["gw"], ctx["rules"], ctx["df"]
     team, plan = ctx["team"], ctx["plan"]
     squad = optimise.best_squad(df, rules)
@@ -423,6 +474,8 @@ def render(store: Store, entry_id: int = DEFAULT_ENTRY) -> str:
   <strong>FPL</strong> is their own estimate for comparison.</p>
 </section>
 
+{_sync_section(ctx)}
+
 <section>
   <h2>Recent price moves</h2>
   {_price_table(store)}
@@ -455,6 +508,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Render the dashboard to HTML")
     ap.add_argument("--out", default="site/index.html", help="output path")
     ap.add_argument("--entry", type=int, default=DEFAULT_ENTRY, help="FPL entry id")
+    ap.add_argument("--swaps", default="",
+                    help="manual squad override, e.g. 'Thiago>Watkins, Isak>Nketiah'")
     ap.add_argument("--brief", action="store_true",
                     help="print the markdown summary instead of writing HTML")
     ap.add_argument("--title", action="store_true",
@@ -467,9 +522,9 @@ def main(argv: list[str] | None = None) -> int:
             print(title(store, args.entry))
             return 0
         if args.brief:
-            print(brief(store, args.entry))
+            print(brief(store, args.entry, args.swaps))
             return 0
-        page = render(store, args.entry)
+        page = render(store, args.entry, args.swaps)
     finally:
         store.close()
 

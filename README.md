@@ -184,7 +184,33 @@ break because a CDN moved.
 > page — no tokens, no cookies — but if that visibility is unwanted, delete the
 > `deploy` job from the pipeline and use the Actions job summary instead.
 
-Enabling it is a one-time setting: **Settings → Pages → Source: GitHub Actions**.
+Enabling it is a one-time setting: **Settings → Pages → Source: GitHub Actions**. On
+GitHub Free the repository must be public for Pages to work at all — private-repo
+Pages needs a paid plan.
+
+### Syncing after you change your team
+
+The page has a **Sync now** button, which opens the pipeline's run page on GitHub.
+One click there and the page rebuilds in about two minutes.
+
+What a sync picks up: prices, injuries, team news, fixtures, and any transfer FPL
+has published.
+
+What it cannot: a squad change made for the *upcoming* gameweek. FPL publishes picks
+per completed gameweek, so `entry/{id}/event/{next}/picks/` returns 404 until that
+deadline passes — a refresh genuinely cannot see a team you changed an hour ago. Two
+things close that gap:
+
+- Transfers already made for the upcoming gameweek show up in
+  `entry/{id}/transfers/` and are replayed onto the last published squad
+  automatically.
+- The `swap` input on the run page, for anything still invisible:
+  `Thiago>Watkins, Isak>Calvert-Lewin`. Web names or element ids; ambiguous names
+  are rejected rather than guessed at, since several players share a web name. Each
+  swap spends a free transfer and moves the price difference through the bank.
+
+Reading a pre-deadline squad directly would need an authenticated `my-team` call,
+which this project does not have.
 
 ## Checking it works
 

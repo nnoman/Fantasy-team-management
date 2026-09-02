@@ -106,3 +106,82 @@ def test_a_played_match_counts_before_bonus_is_confirmed(tmp_path):
         assert played[2] == 2
     finally:
         store.close()
+
+
+def _pick(element, position=1, cost=100):
+    return team_mod.Pick(element=element, position=position, is_captain=False,
+                         is_vice=False, element_type=3, purchase_cost=cost,
+                         now_cost=cost, selling_price=cost)
+
+
+def _team(elements, bank=15, ft=2):
+    return team_mod.Team(entry_id=1, gameweek=2, bank=bank, value=1000,
+                         free_transfers=ft,
+                         picks=[_pick(e, i + 1) for i, e in enumerate(elements)])
+
+
+def test_swap_replaces_a_player_and_moves_the_money():
+    t = _team([1, 2, 3])
+    lookup = {"in": 9}
+    costs = {9: 80}
+    team_mod.apply_swaps(t, "2>9", lookup, costs)
+
+    ids = [p.element for p in t.picks]
+    assert 2 not in ids and 9 in ids
+    assert len(t.picks) == 3, "a swap is one out, one in"
+    # Sold at 100, bought at 80, so 20 lands in the bank.
+    assert t.bank == 15 + 20
+    bought = next(p for p in t.picks if p.element == 9)
+    assert bought.purchase_cost == 80
+    assert bought.selling_price == 80, "no profit to share on something just bought"
+
+
+def test_swap_accepts_names_and_rejects_ambiguity():
+    t = _team([1, 2, 3])
+    # Several real players share a web name, so guessing would pick the wrong one.
+    with pytest.raises(ValueError, match="matches 2 players"):
+        team_mod.apply_swaps(t, "1>palmer", {"palmer": [154, 500]}, {})
+
+    t2 = _team([1, 2, 3])
+    team_mod.apply_swaps(t2, "1>watkins", {"watkins": 60}, {60: 79})
+    assert 60 in [p.element for p in t2.picks]
+
+
+def test_swap_rejects_nonsense_rather_than_guessing():
+    with pytest.raises(ValueError, match="not in the squad"):
+        team_mod.apply_swaps(_team([1, 2, 3]), "99>4", {}, {})
+    with pytest.raises(ValueError, match="no player called"):
+        team_mod.apply_swaps(_team([1, 2, 3]), "1>nobody", {}, {})
+    with pytest.raises(ValueError, match="expected 'out>in'"):
+        team_mod.apply_swaps(_team([1, 2, 3]), "1 to 4", {}, {})
+
+
+def test_empty_swap_is_a_no_op():
+    t = _team([1, 2, 3])
+    assert team_mod.apply_swaps(t, "", {}, {}) is t
+    assert team_mod.apply_swaps(t, "   ", {}, {}) is t
+    assert [p.element for p in t.picks] == [1, 2, 3]
+
+
+def test_pending_transfers_are_replayed_onto_published_picks():
+    """FPL publishes picks per completed gameweek, so a transfer made for the
+    upcoming one is invisible in any picks payload. Replaying it keeps the squad
+    current instead of a week stale."""
+    published = [
+        {"element": 1, "position": 1, "is_captain": True, "is_vice_captain": False},
+        {"element": 2, "position": 2, "is_captain": False, "is_vice_captain": False},
+    ]
+    out = team_mod._replay(published, [{"event": 3, "element_out": 1, "element_in": 7}])
+    ids = {p["element"] for p in out}
+    assert ids == {7, 2}
+    # Captaincy cannot follow a player who has been sold.
+    assert not any(p.get("is_captain") for p in out)
+
+
+def test_replay_handles_a_player_transferred_in_then_out_again():
+    published = [{"element": 1, "position": 1}]
+    out = team_mod._replay(published, [
+        {"event": 3, "element_out": 1, "element_in": 7, "time": "2026-09-01T10:00:00Z"},
+        {"event": 3, "element_out": 7, "element_in": 9, "time": "2026-09-02T10:00:00Z"},
+    ])
+    assert [p["element"] for p in out] == [9]

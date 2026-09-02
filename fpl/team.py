@@ -13,10 +13,20 @@ Two consequences worth being explicit about:
   today and keeps working when a token expires.
 - Only the write path — actually making the transfer — needs authentication.
 
-The one thing genuinely not public is your squad *before* the upcoming deadline
-if you have already made changes for it; picks are published per completed
-gameweek. So this reads the most recent published gameweek, which is your
-current squad unless you have already transferred for the next one.
+The one genuine gap: FPL publishes picks per *completed* gameweek, so your squad
+for the upcoming deadline is not public. `entry/{id}/event/{next}/picks/` returns
+404 until that gameweek closes. Two things close the gap:
+
+- Transfers already made for the upcoming gameweek appear in
+  `entry/{id}/transfers/` with that gameweek's number, so they are replayed onto
+  the last published squad. Whether FPL exposes them there before the deadline
+  is not something this code can assume, so it is treated as best-effort.
+- A manual `swap` override, for changes that are not visible either way. It
+  takes web names or element ids, so a human can type it.
+
+Neither is a workaround for authentication. With a token, `my-team/{id}/` would
+answer this directly and exactly; without one, this is as close as public data
+gets.
 """
 
 from __future__ import annotations
@@ -60,6 +70,10 @@ class Team:
     chips_used: list[str] = field(default_factory=list)
     total_points: int = 0
     overall_rank: int | None = None
+    # Transfers already made for the upcoming gameweek and replayed onto the
+    # last published squad. Surfaced so the dashboard can say whether what it
+    # shows is confirmed or reconstructed.
+    pending_transfers: int = 0
 
     @property
     def element_ids(self) -> list[int]:
@@ -77,6 +91,79 @@ class Team:
     def budget(self) -> int:
         """What a full rebuild could spend: everything sellable plus the bank."""
         return sum(p.selling_price for p in self.picks) + self.bank
+
+
+def _replay(raw_picks: list[dict], transfers: list[dict]) -> list[dict]:
+    """Apply transfers made after the last published gameweek, in order.
+
+    Each swap keeps the outgoing player's squad position so the starting eleven
+    and bench order stay meaningful; FPL would re-derive them at the deadline
+    anyway, and the optimiser recomputes both regardless.
+    """
+    picks = {p["element"]: dict(p) for p in raw_picks}
+    for t in sorted(transfers, key=lambda t: (t.get("event", 0), t.get("time", ""))):
+        out_id, in_id = t.get("element_out"), t.get("element_in")
+        if out_id not in picks:
+            continue                      # already replaced by a later transfer
+        slot = picks.pop(out_id)
+        slot["element"] = in_id
+        # Captaincy cannot follow a player who has been sold.
+        if slot.get("is_captain") or slot.get("is_vice_captain"):
+            slot["is_captain"] = slot["is_vice_captain"] = False
+        picks[in_id] = slot
+    return list(picks.values())
+
+
+def apply_swaps(team: "Team", swaps: str, lookup: dict[str, int],
+                costs: dict[int, int]) -> "Team":
+    """Manually override the squad, for changes public data cannot show.
+
+    `swaps` is "out>in" pairs separated by commas, using web names or element
+    ids: "Thiago>Watkins, Isak>Calvert-Lewin". Names are matched case-insensitively
+    and must be unambiguous -- several players share a web name, so an ambiguous
+    one is rejected rather than guessed at.
+    """
+    if not swaps or not swaps.strip():
+        return team
+
+    def resolve(token: str) -> int:
+        token = token.strip()
+        if token.isdigit():
+            return int(token)
+        matches = lookup.get(token.casefold())
+        if matches is None:
+            raise ValueError(f"no player called {token!r}")
+        if isinstance(matches, list):
+            raise ValueError(
+                f"{token!r} matches {len(matches)} players — use an element id"
+            )
+        return matches
+
+    by_id = {p.element: p for p in team.picks}
+    for pair in swaps.split(","):
+        if not pair.strip():
+            continue
+        if ">" not in pair:
+            raise ValueError(f"expected 'out>in', got {pair.strip()!r}")
+        out_token, in_token = pair.split(">", 1)
+        out_id, in_id = resolve(out_token), resolve(in_token)
+        if out_id not in by_id:
+            raise ValueError(f"{out_token.strip()!r} is not in the squad")
+        old = by_id.pop(out_id)
+        cost = costs.get(in_id, old.now_cost)
+        by_id[in_id] = Pick(
+            element=in_id, position=old.position,
+            is_captain=False, is_vice=False,
+            element_type=old.element_type,
+            # A player just bought was bought at today's price, so there is no
+            # profit to share and the sell price is what was paid.
+            purchase_cost=cost, now_cost=cost, selling_price=cost,
+        )
+        # The sale funds the purchase; the bank absorbs the difference.
+        team.bank += old.selling_price - cost
+
+    team.picks = list(by_id.values())
+    return team
 
 
 def selling_price(purchase: int, now: int) -> int:
@@ -117,8 +204,13 @@ def free_transfers(history: dict, cap: int = DEFAULT_FT_CAP) -> int:
 
 
 def load(entry_id: int, client: Client | None = None,
-         store: Store | None = None, cap: int = DEFAULT_FT_CAP) -> Team:
-    """Fetch the manager's current squad and finances from public endpoints."""
+         store: Store | None = None, cap: int = DEFAULT_FT_CAP,
+         swaps: str = "") -> Team:
+    """Fetch the manager's current squad and finances from public endpoints.
+
+    `swaps` manually overrides the squad afterwards, for changes made before a
+    deadline that FPL has not published. See apply_swaps().
+    """
     client = client or Client()
     history = client.entry_history(entry_id)
     played = sorted(history.get("current") or [], key=lambda c: c["event"])
@@ -143,8 +235,16 @@ def load(entry_id: int, client: Client | None = None,
     for t in sorted(prices, key=lambda t: t.get("event", 0)):
         paid[t["element_in"]] = t["element_in_cost"]
 
+    # Transfers recorded for a gameweek later than the last published one have
+    # been made but not yet reflected in any picks payload. Replay them so the
+    # squad is current rather than a week stale.
+    pending = [t for t in prices if (t.get("event") or 0) > gw]
+
     bootstrap = client.bootstrap_static()
     elements = {e["id"]: e for e in bootstrap["elements"]}
+
+    if pending:
+        raw_picks = _replay(raw_picks, pending)
 
     picks = []
     for p in raw_picks:
@@ -164,7 +264,7 @@ def load(entry_id: int, client: Client | None = None,
             selling_price=selling_price(purchase, now),
         ))
 
-    return Team(
+    team = Team(
         entry_id=entry_id,
         gameweek=gw,
         picks=picks,
@@ -174,7 +274,25 @@ def load(entry_id: int, client: Client | None = None,
         chips_used=[c.get("name") for c in (history.get("chips") or [])],
         total_points=latest.get("total_points") or 0,
         overall_rank=latest.get("overall_rank"),
+        pending_transfers=len(pending),
     )
+
+    if swaps:
+        lookup: dict[str, int | list[int]] = {}
+        for el in elements.values():
+            key = el["web_name"].casefold()
+            if key in lookup:
+                existing = lookup[key]
+                lookup[key] = (existing if isinstance(existing, list) else [existing])
+                lookup[key].append(el["id"])
+            else:
+                lookup[key] = el["id"]
+        team = apply_swaps(team, swaps,
+                           lookup, {e["id"]: e["now_cost"] for e in elements.values()})
+        # A manual swap is a transfer, so it spends the allowance.
+        team.free_transfers = max(0, team.free_transfers - len(
+            [p for p in swaps.split(",") if p.strip()]))
+    return team
 
 
 def main(argv: list[str] | None = None) -> int:
